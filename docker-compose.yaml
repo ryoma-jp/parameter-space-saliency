@@ -1,0 +1,25 @@
+version: '3.9'
+
+services:
+  pss:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: >
+      bash -c "
+        cd /work && 
+        jupyter notebook
+      "
+    volumes:
+      - type: bind
+        source: .
+        target: /work
+    ports:
+      - 35000:8888
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

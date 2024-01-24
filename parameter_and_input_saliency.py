@@ -238,7 +238,7 @@ if __name__ == '__main__':
     readable_labels = ''
     for f in label_url:
         readable_labels = readable_labels + f.decode("utf-8")
-    readable_labels = yaml.load(readable_labels)
+    readable_labels = yaml.load(readable_labels, Loader=yaml.Loader)
     # Model
     print('==> Building model..')
 

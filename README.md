@@ -6,9 +6,11 @@ Conventional saliency maps highlight input features to which neural network pred
 
 Getting started
 ---------------
-This repo uses <a href = "https://www.python.org/downloads/">Python 3</a>. To install the requirements, run
-```bash
-pip install -r requirements.txt
+```
+$ docker-compose build
+$ docker-compose up -d
+$ docker-compose exec pss bash
+# cd /work
 ```
 
 Basic Use
