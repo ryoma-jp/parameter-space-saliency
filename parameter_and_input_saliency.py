@@ -30,6 +30,7 @@ parser.add_argument('--data_to_use', default='ImageNet', type=str, help='which d
 # Logging
 # parser.add_argument('--project_name', default='input_space_saliency', type=str, help='project name for Comet ML')
 parser.add_argument('--figure_folder_name', default='input_space_saliency', type=str, help='directory to save figures')
+parser.add_argument('--output_root', default='figures', type=str, help='root directory to save output figures')
 
 # Modes for the signed saliency model: by default, regular loss on the given example is used.
 #All final experiments were done with the following options off
@@ -76,9 +77,8 @@ def save_gradients(grads_to_save, args, experiment, reference_image, inv_transfo
     plt.figure()
     plt.imshow(grads_to_save)
 
-    save_path = os.path.join('figures', args.figure_folder_name)
-    if not os.path.exists(save_path):
-        os.mkdir(save_path)
+    save_path = os.path.join(args.output_root, args.figure_folder_name)
+    os.makedirs(save_path, exist_ok=True)
     save_name = str(args.reference_id) if args.reference_id is not None else args.image_path.split('/')[-1].split('.')[0]
     save_name += '_' + args.model
     plt.axis('off')
@@ -200,6 +200,8 @@ if __name__ == '__main__':
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     args = parser.parse_args()
     experiment = None #Used to be a comet_ml experiment for logging
+
+    os.makedirs(args.output_root, exist_ok=True)
 
     model_helpers_root_path = os.path.join('helper_objects', args.model)
     if not os.path.exists(model_helpers_root_path):
@@ -362,7 +364,7 @@ if __name__ == '__main__':
     ax.set_ylabel('Saliency')
     save_name = str(args.reference_id) if args.reference_id is not None else args.image_path.split('/')[-1].split('.')[0]
     save_name += '_' + args.model
-    fig.savefig('figures/filter_saliency_{}.png'.format(save_name))
-    print('Filter saliency saved to figures/filter_saliency_{}.png'.format(save_name))
+    fig.savefig(os.path.join(args.output_root, 'filter_saliency_{}.png'.format(save_name)))
+    print('Filter saliency saved to {}'.format(os.path.join(args.output_root, 'filter_saliency_{}.png'.format(save_name))))
 #Run this: python3 input_saliency.py --reference_id 107 --k_salient 10
 #Run this: python3 parameter_and_input_saliency.py --image_path raw_images/great_white_shark_mispred_as_killer_whale.jpeg --image_target_label 2
