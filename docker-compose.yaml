@@ -1,15 +1,11 @@
-version: '3.9'
-
 services:
   pss:
     build:
       context: .
       dockerfile: Dockerfile
+    working_dir: /work
     command: >
-      bash -c "
-        cd /work && 
-        jupyter notebook
-      "
+      bash -c "jupyter notebook"
     volumes:
       - type: bind
         source: .

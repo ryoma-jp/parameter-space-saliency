@@ -191,6 +191,8 @@ if __name__ == '__main__':
 
     torch.manual_seed(40)
     np.random.seed(40)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(40)
 
     ###########################################################
     ####Define net, testset, precompute testset avg saliency
@@ -259,7 +261,8 @@ if __name__ == '__main__':
 
     if device == 'cuda':
         net = torch.nn.DataParallel(net)
-        cudnn.benchmark = True
+        cudnn.benchmark = False
+        cudnn.deterministic = True
 
     layer_to_filter_id = {}
     ind = 0
