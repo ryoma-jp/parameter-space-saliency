@@ -1,70 +1,122 @@
-# from comet_ml import Experiment
 import yaml
 import urllib
-import pandas as pd
-import torch.autograd as autograd
 import torch
-import torch.nn as nn
-import torch.optim as optim
-import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
 import torchvision
-import torchvision.transforms as transforms
 import argparse
 import os
-import time
 import seaborn as sns
 import matplotlib.pyplot as plt
-import matplotlib
 import numpy as np
-from utils import show_heatmap_on_image, test_and_find_incorrectly_classified, transform_raw_image
 import cv2
 import warnings
-import tqdm
+
+from utils import show_heatmap_on_image, test_and_find_incorrectly_classified, transform_raw_image
 from parameter_saliency.saliency_model_backprop import SaliencyModel, find_testset_saliency
+from model_adapter.factory import build_model_adapter
+from task_adapter.classification import ClassificationTaskAdapter
+from target.spec import TargetSpec, TargetType
 
-parser = argparse.ArgumentParser(description='Input Space Saliency')
-parser.add_argument('--model', default='resnet50', type=str, help='name of architecture')
-parser.add_argument('--data_to_use', default='ImageNet', type=str, help='which dataset to use (ImageNet or ImageNet_A)')
+parser = argparse.ArgumentParser(description='Parameter-Space and Input-Space Saliency')
 
-# Logging
-# parser.add_argument('--project_name', default='input_space_saliency', type=str, help='project name for Comet ML')
-parser.add_argument('--figure_folder_name', default='input_space_saliency', type=str, help='directory to save figures')
-parser.add_argument('--output_root', default='figures', type=str, help='root directory to save output figures')
+# ----- Model -----
+parser.add_argument('--model', default='resnet50', type=str,
+                    help='torchvision model name (used when --model_source torchvision)')
+parser.add_argument('--model_source', default='torchvision',
+                    choices=['torchvision', 'custom_module'],
+                    help='source of the model')
+parser.add_argument('--model_class_path', default=None, type=str,
+                    help='fully-qualified class path for custom_module, e.g. mypkg.models.MyNet')
+parser.add_argument('--model_weights_path', default=None, type=str,
+                    help='path to weights checkpoint for custom_module')
 
-# Modes for the signed saliency model: by default, regular loss on the given example is used.
-#All final experiments were done with the following options off
+# ----- Dataset -----
+parser.add_argument('--data_to_use', default='ImageNet', type=str,
+                    help='which dataset to use (currently only ImageNet)')
+parser.add_argument('--imagenet_val_path', default='<insert-ImageNet-val-path-here>',
+                    type=str, help='ImageNet validation set path')
+
+# ----- Target -----
+parser.add_argument('--target_type', default='true_label',
+                    choices=['true_label', 'predicted_top1', 'specified_class'],
+                    help='what to use as the saliency target')
+parser.add_argument('--target_class_id', default=None, type=int,
+                    help='class id when --target_type specified_class')
+
+# ----- Label map -----
+parser.add_argument('--label_map_path', default=None, type=str,
+                    help='path to YAML label map {int: str}; '
+                         'if omitted, ImageNet labels are downloaded for torchvision models')
+
+# ----- Output -----
+parser.add_argument('--figure_folder_name', default='input_space_saliency', type=str,
+                    help='subdirectory under output_root for input-space figures')
+parser.add_argument('--output_root', default='figures', type=str,
+                    help='root directory to save output figures')
+
+# ----- Saliency options -----
 parser.add_argument('--signed', action='store_true', help='Use signed saliency')
-parser.add_argument('--logit', action='store_true', help='Use logits to compute parameter saliency')
-parser.add_argument('--logit_difference', action='store_true', help='Use logit difference as parameter saliency loss')
+parser.add_argument('--logit', action='store_true',
+                    help='[deprecated, not implemented] Use logits rather than cross-entropy')
+parser.add_argument('--logit_difference', action='store_true',
+                    help='[deprecated, not implemented] Use logit difference as loss')
 
-
-#Boosting for input-space saliency
-parser.add_argument('--boost_factor', default=100.0, type=float, help='boost factor for salient filters')
-parser.add_argument('--k_salient', default=10, type=int, help='num filters to boost')
-
+# ----- Input-space saliency (boosting) -----
+parser.add_argument('--boost_factor', default=100.0, type=float,
+                    help='boost factor for salient filters')
+parser.add_argument('--k_salient', default=10, type=int,
+                    help='number of top salient filters to boost')
 parser.add_argument('--compare_random', action='store_true',
-                    help='whether to boost k random filters for comparison')
-# parser.add_argument('--least_salient', action='store_true',
-#                     help='whether to boost k least salient filters for comparison to frying most salient')
+                    help='boost k random filters for comparison')
 
-#Smoothing input space saliency (SmoothGrad-like, should be set to default, off at all times)
-parser.add_argument('--noise_iters', default=1, type=int, help='number of noises to average across')
-parser.add_argument('--noise_percent', default=0, type=float, help='std of the noises')
+# ----- SmoothGrad-like options -----
+parser.add_argument('--noise_iters', default=1, type=int,
+                    help='number of noise iterations to average')
+parser.add_argument('--noise_percent', default=0, type=float,
+                    help='std of the noise')
 
-#Pick reference image
-#Either using an image from raw_images/ folder
-parser.add_argument('--image_path', default='raw_images/great_white_shark_mispred_as_killer_whale.jpeg', type=str, help='image id from valset to use')
-parser.add_argument('--image_target_label', default=None, type=int, help='image label (number from 0 to 999 according to ImageNet labels)')
-#Or using the i-th image from ImageNet validation set, for this ImageNet validation set path must be specified
-parser.add_argument('--reference_id', default=None, type=int, help='image id from valset to use') #107 for great white shark
+# ----- Reference image -----
+parser.add_argument('--image_path',
+                    default='raw_images/great_white_shark_mispred_as_killer_whale.jpeg',
+                    type=str, help='path to a raw image file')
+parser.add_argument('--image_target_label', default=None, type=int,
+                    help='ground-truth class index (0-based) for the raw image')
+parser.add_argument('--reference_id', default=None, type=int,
+                    help='index of image in the validation set')
 
-#PATHS
-parser.add_argument('--imagenet_val_path', default='<insert-ImageNet-val-path-here>', type=str, help='ImageNet validation set path')#/home/rilevin/data/ImageNet/val
-# parser.add_argument('--testset_stats_path', default='', type=str, help='filter saliency over the testset (where to save)')
-# parser.add_argument('--inference_file_path', default='', type=str, help='where to save network inference results')
+def _cache_key(args) -> str:
+    """Derive a filesystem-safe cache key from model arguments."""
+    if args.model_source == 'torchvision':
+        return args.model
+    return args.model_class_path.split('.')[-1]
 
-def save_gradients(grads_to_save, args, experiment, reference_image, inv_transform_test):
+
+def _load_label_map(args) -> dict:
+    """Load or download a label map {int -> str}."""
+    if args.label_map_path:
+        with open(args.label_map_path) as f:
+            return yaml.load(f, Loader=yaml.Loader)
+    if args.model_source == 'torchvision':
+        label_url = urllib.request.urlopen(
+            'https://gist.githubusercontent.com/yrevar/942d3a0ac09ec9e5eb3a'
+            '/raw/238f720ff059c1f82f368259d1ca4ffa5dd8f9f5/imagenet1000_clsidx_to_labels.txt'
+        )
+        raw = ''.join(f.decode('utf-8') for f in label_url)
+        return yaml.load(raw, Loader=yaml.Loader)
+    return {}
+
+
+def _build_model_spec(args) -> dict:
+    """Build a model spec dict from CLI args."""
+    if args.model_source == 'torchvision':
+        return {'source': 'torchvision', 'name': args.model, 'pretrained': True}
+    spec = {'source': 'custom_module', 'class_path': args.model_class_path}
+    if args.model_weights_path:
+        spec['weights_path'] = args.model_weights_path
+    return spec
+
+
+def save_gradients(grads_to_save, args, reference_image, inv_transform_test):
     grads_to_save, _ = grads_to_save.max(dim=1)
     grads_to_save = grads_to_save.detach().cpu().numpy().reshape((224, 224))
     grads_to_save = np.abs(grads_to_save)
@@ -79,93 +131,84 @@ def save_gradients(grads_to_save, args, experiment, reference_image, inv_transfo
 
     save_path = os.path.join(args.output_root, args.figure_folder_name)
     os.makedirs(save_path, exist_ok=True)
-    save_name = str(args.reference_id) if args.reference_id is not None else args.image_path.split('/')[-1].split('.')[0]
-    save_name += '_' + args.model
+    ck = _cache_key(args)
+    save_name = (str(args.reference_id) if args.reference_id is not None
+                 else args.image_path.split('/')[-1].split('.')[0])
+    save_name += '_' + ck
     plt.axis('off')
-    # plt.savefig(os.path.join(save_path, 'input_space_saliency_{}.pdf'.format(save_name)), bbox_inches='tight')
-
 
     grads_to_save = (grads_to_save - np.min(grads_to_save)) / (np.max(grads_to_save) - np.min(grads_to_save))
 
-    #Superimpose gradient heatmap
     reference_image_to_compare = inv_transform_test(reference_image[0].cpu()).permute(1, 2, 0)
     gradients_heatmap = np.ones_like(grads_to_save) - grads_to_save
     gradients_heatmap = cv2.GaussianBlur(gradients_heatmap, (3, 3), 0)
 
-    #Save the heatmap
-    heatmap_superimposed = show_heatmap_on_image(reference_image_to_compare.detach().cpu().numpy(), gradients_heatmap)
+    heatmap_superimposed = show_heatmap_on_image(
+        reference_image_to_compare.detach().cpu().numpy(), gradients_heatmap
+    )
     plt.imshow(heatmap_superimposed)
     plt.axis('off')
-    plt.savefig(os.path.join(save_path, 'input_saliency_heatmap_{}.png'.format(save_name)), bbox_inches='tight')
-    print('Input space saliency saved to {} \n'.format(os.path.join(save_path, 'input_saliency_heatmap_{}.png'.format(save_name))))
+    out_path = os.path.join(save_path, f'input_saliency_heatmap_{save_name}.png')
+    plt.savefig(out_path, bbox_inches='tight')
+    print(f'Input space saliency saved to {out_path}\n')
     return
 
-def compute_input_space_saliency(reference_inputs, reference_targets, net, args, experiment,
-                                 testset_mean_stat=None, testset_std_stat=None, inv_transform_test = None,
-                                 readable_labels = None):
-    #First, log things
-    with torch.no_grad():
-        ref_image_to_log = inv_transform_test(reference_inputs[0].detach().cpu()).permute(1, 2, 0)
-
-
-        reference_outputs = net(reference_inputs)
-        _, reference_predicted = reference_outputs.max(1)
-        # Log classes:
-        print("""\n
-        Image target label: {}
-        Image target class name: {}
-        Image predicted label: {}
-        Image predicted class name: {}\n
-        """.format(reference_targets[0].item(),
-            readable_labels[reference_targets[0].item()],
-            reference_predicted[0].item(),
-            readable_labels[reference_predicted[0].item()]))
-
-    #Compute filter saliency
+def compute_input_space_saliency(
+    reference_inputs, reference_targets, net, args,
+    task_adapter, target_spec,
+    testset_mean_stat=None, testset_std_stat=None,
+    inv_transform_test=None, readable_labels=None,
+):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    filter_saliency_model = SaliencyModel(net, nn.CrossEntropyLoss(), device='cuda', mode='std',
-                                          aggregation='filter_wise', signed=args.signed, logit=args.logit,
-                                          logit_difference=args.logit_difference)
-    reference_inputs, reference_targets = reference_inputs.to(device), reference_targets.to(device)
+
+    # Log prediction summary via TaskAdapter
+    task_adapter.summarize_prediction(
+        net,
+        reference_inputs.to(device),
+        reference_targets.to(device),
+        readable_labels or {},
+    )
+
+    filter_saliency_model = SaliencyModel(
+        net, task_adapter,
+        device=device, mode='std',
+        aggregation='filter_wise', signed=args.signed,
+    )
+    reference_inputs  = reference_inputs.to(device)
+    reference_targets = reference_targets.to(device)
 
     grad_samples = []
-    #Errors are a fragile concept, we should not perturb too much, we will end up on the object
-    for noise_iter in range(args.noise_iters):
+    for _ in range(args.noise_iters):
         perturbed_inputs = reference_inputs.detach().clone()
-        perturbed_inputs = (1-args.noise_percent)*perturbed_inputs + args.noise_percent*torch.randn_like(perturbed_inputs)
-
-        perturbed_outputs = net(perturbed_inputs)
-        _, perturbed_predicted = perturbed_outputs.max(1)
-        # print(readable_labels[int(perturbed_predicted[0])])
-
-        #Backprop to the input
+        perturbed_inputs = (
+            (1 - args.noise_percent) * perturbed_inputs
+            + args.noise_percent * torch.randn_like(perturbed_inputs)
+        )
         perturbed_inputs.requires_grad_()
-        #Find the true saliency:
-        filter_saliency = filter_saliency_model(
-            perturbed_inputs, reference_targets,
-            testset_mean_abs_grad=testset_mean_stat,
-            testset_std_abs_grad=testset_std_stat).to(device)
 
-        #Find the top-k salient filters
+        filter_saliency = filter_saliency_model(
+            perturbed_inputs, reference_targets, target_spec,
+            testset_mean_abs_grad=testset_mean_stat,
+            testset_std_abs_grad=testset_std_stat,
+        ).to(device)
+
         if args.compare_random:
             sorted_filters = torch.randperm(filter_saliency.size(0)).cpu().numpy()
         else:
             sorted_filters = torch.argsort(filter_saliency, descending=True).cpu().numpy()
 
-        #Boost them:
         filter_saliency_boosted = filter_saliency.detach().clone()
         filter_saliency_boosted[sorted_filters[:args.k_salient]] *= args.boost_factor
 
-        #Form matching loss and take the gradient:
         matching_criterion = torch.nn.CosineSimilarity()
-        matching_loss = matching_criterion(filter_saliency[None, :], filter_saliency_boosted[None, :])
+        matching_loss = matching_criterion(
+            filter_saliency[None, :], filter_saliency_boosted[None, :]
+        )
         matching_loss.backward()
 
-        grads_to_save = perturbed_inputs.grad.detach().cpu()
-        grad_samples.append(grads_to_save)
-    #Find averaged gradients (smoothgrad-like)
-    grads_to_save = torch.stack(grad_samples).mean(0)
+        grad_samples.append(perturbed_inputs.grad.detach().cpu())
 
+    grads_to_save = torch.stack(grad_samples).mean(0)
     return grads_to_save, filter_saliency
 
 
@@ -194,177 +237,172 @@ if __name__ == '__main__':
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(40)
 
-    ###########################################################
-    ####Define net, testset, precompute testset avg saliency
-    ###########################################################
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    args = parser.parse_args()
-    experiment = None #Used to be a comet_ml experiment for logging
+    args   = parser.parse_args()
+
+    if args.logit or args.logit_difference:
+        raise NotImplementedError('--logit and --logit_difference are not yet implemented.')
 
     os.makedirs(args.output_root, exist_ok=True)
 
-    model_helpers_root_path = os.path.join('helper_objects', args.model)
-    if not os.path.exists(model_helpers_root_path):
-        print('No helper objects directory exists for this model, creating one\n')
-        os.mkdir(model_helpers_root_path)
+    # ------------------------------------------------------------------ #
+    # Model                                                                #
+    # ------------------------------------------------------------------ #
+    print('==> Building model..')
+    adapter = build_model_adapter(_build_model_spec(args))
+    net     = adapter.build_model()
 
+    # Saliency units: derived BEFORE DataParallel to keep layer names clean
+    layer_to_filter_id = adapter.iter_saliency_units(net)
+    total_filters = sum(len(v) for v in layer_to_filter_id.values())
+    print(f'Total filters: {total_filters}')
+    print(f'Total layers:  {len(layer_to_filter_id)}')
+
+    transform_test     = adapter.get_preprocess()
+    inv_transform_test = adapter.get_inv_preprocess()
+
+    net = net.to(device)
+    net.eval()
+    if device == 'cuda':
+        net = torch.nn.DataParallel(net)
+        cudnn.benchmark    = False
+        cudnn.deterministic = True
+
+    # ------------------------------------------------------------------ #
+    # Task & target                                                        #
+    # ------------------------------------------------------------------ #
+    task_adapter = ClassificationTaskAdapter()
+    target_spec  = TargetSpec.from_args(args.target_type, args.target_class_id)
+
+    # ------------------------------------------------------------------ #
+    # Dataset                                                              #
+    # ------------------------------------------------------------------ #
     print('==> Preparing data..')
-
-    transform_test = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),  ## ImageNet statistics
-    ])
-
-    inv_transform_test = transforms.Compose([
-        transforms.Normalize(mean=(0., 0., 0.), std=(1 / 0.229, 1 / 0.224, 1 / 0.225)),
-        transforms.Normalize(mean=(-0.485, -0.456, -0.406), std=(1., 1., 1.)),
-    ])
-
-    # ImageNet validation set
+    testset = None
     if args.data_to_use == 'ImageNet':
         images_path = args.imagenet_val_path
     else:
-        raise NotImplementedError
+        raise NotImplementedError(f'data_to_use={args.data_to_use!r} is not supported.')
 
     if images_path != '<insert-ImageNet-val-path-here>':
         testset = torchvision.datasets.ImageFolder(images_path, transform=transform_test)
     else:
-        print("""
-               ImageNet validation set path is not specified.
-               The code will only work with raw --image_path and --image_target_label specified.
-               In this scenario, --reference_id must be None.
-              """)
-    # Downloading imagenet 1000 classes list of readable labels
-    label_url = urllib.request.urlopen(
-        "https://gist.githubusercontent.com/yrevar/942d3a0ac09ec9e5eb3a/raw/238f720ff059c1f82f368259d1ca4ffa5dd8f9f5/imagenet1000_clsidx_to_labels.txt")
-    readable_labels = ''
-    for f in label_url:
-        readable_labels = readable_labels + f.decode("utf-8")
-    readable_labels = yaml.load(readable_labels, Loader=yaml.Loader)
-    # Model
-    print('==> Building model..')
+        print(
+            '\n  ImageNet validation set path is not specified.\n'
+            '  The code will only work with --image_path and --image_target_label.\n'
+            '  --reference_id requires the validation set path.\n'
+        )
 
-    if args.model == 'resnet50':
-        net = torchvision.models.resnet50(pretrained=True)
-    elif args.model == 'vgg19':
-        net = torchvision.models.vgg19(pretrained=True)
-    elif args.model == 'densenet121':
-        net = torchvision.models.densenet121(pretrained=True)
-    elif args.model == 'inception_v3':
-        net = torchvision.models.inception_v3(pretrained=True)
-    else:
-        #Other torchvision models should be inserted here
-        raise NotImplementedError
+    # ------------------------------------------------------------------ #
+    # Label map                                                            #
+    # ------------------------------------------------------------------ #
+    readable_labels = _load_label_map(args)
 
-    net = net.to(device)
-    net.eval()
+    # ------------------------------------------------------------------ #
+    # Cache paths                                                          #
+    # ------------------------------------------------------------------ #
+    ck = _cache_key(args)
+    model_helpers_root_path = os.path.join('helper_objects', ck)
+    os.makedirs(model_helpers_root_path, exist_ok=True)
 
-    if device == 'cuda':
-        net = torch.nn.DataParallel(net)
-        cudnn.benchmark = False
-        cudnn.deterministic = True
+    # Include target_type in stats filename so different targets use separate caches
+    target_suffix = '' if args.target_type == 'true_label' else f'_{args.target_type}'
 
-    layer_to_filter_id = {}
-    ind = 0
-    for layer_num, (name, param) in enumerate(net.named_parameters()):
-        # print(name, param.shape)
-        if len(param.size()) == 4:
-            # if 'conv' not in name:
-            #     print('Not a conv layer {}: {}'.format(name, layer_num))
-            for j in range(param.size()[0]):
-                if name not in layer_to_filter_id:
-                    layer_to_filter_id[name] = [ind + j]
-                else:
-                    layer_to_filter_id[name].append(ind + j)
-
-            ind += param.size()[0]
-
-
-    # print('Unit of interest:', filter_id_to_layer_filter_id[22101])
-    total = 0
-    for layer in layer_to_filter_id:
-        total += len(layer_to_filter_id[layer])
-    print('Total filters:', total)
-    print('Total layers:', len(layer_to_filter_id))
-
-    #Load inference files
-    inference_file = os.path.join(model_helpers_root_path, 'ImageNet_val_inference_results_{:s}.pth'.format(args.model))
+    # ------------------------------------------------------------------ #
+    # Inference cache                                                      #
+    # ------------------------------------------------------------------ #
+    inference_file = os.path.join(
+        model_helpers_root_path,
+        f'ImageNet_val_inference_results_{ck}.pth',
+    )
     if os.path.isfile(inference_file):
-        inf_results = torch.load(inference_file)
-        incorrect_id = inf_results['incorrect_id']
+        inf_results           = torch.load(inference_file)
+        incorrect_id          = inf_results['incorrect_id']
         incorrect_predictions = inf_results['incorrect_predictions']
-        correct_id = inf_results['correct_id']
-    else:
-        warnings.warn("Computing inference, check the names of saved inference files if this was not intended")
-        incorrect_id, incorrect_predictions, correct_id = test_and_find_incorrectly_classified(net, testset)
-        torch.save({'incorrect_id': incorrect_id,
-                    'incorrect_predictions': incorrect_predictions,
-                    'correct_id': correct_id}, inference_file)
+        correct_id            = inf_results['correct_id']
+    elif testset is not None:
+        warnings.warn('Computing inference; check cache filenames if unintended.')
+        incorrect_id, incorrect_predictions, correct_id = \
+            test_and_find_incorrectly_classified(net, testset)
+        torch.save(
+            {'incorrect_id': incorrect_id,
+             'incorrect_predictions': incorrect_predictions,
+             'correct_id': correct_id},
+            inference_file,
+        )
 
-    # if args.logit:
-    #     folder = 'logit'
-    #     warnings.warn('All final experiments were done with args.logit off')
-    # elif args.logit_difference:
-    #     folder = 'logit_difference'
-    #     warnings.warn('All final experiments were done with args.logit_difference off')
-    # else:
-    #     folder = 'loss'
-
-    #Load valset stats files
-    filter_stats_file = os.path.join(model_helpers_root_path, 'ImageNet_val_saliency_stat_{:s}_filter_wise.pth'.format(args.model))
+    # ------------------------------------------------------------------ #
+    # Testset saliency statistics cache                                    #
+    # ------------------------------------------------------------------ #
+    filter_stats_file = os.path.join(
+        model_helpers_root_path,
+        f'ImageNet_val_saliency_stat_{ck}{target_suffix}_filter_wise.pth',
+    )
     if os.path.isfile(filter_stats_file):
-        filter_stats = torch.load(filter_stats_file)
+        filter_stats                 = torch.load(filter_stats_file)
         filter_testset_mean_abs_grad = filter_stats['mean']
-        filter_testset_std_abs_grad = filter_stats['std']
+        filter_testset_std_abs_grad  = filter_stats['std']
+    elif testset is not None:
+        warnings.warn('Computing testset stats; check cache filenames if unintended.')
+        filter_testset_mean_abs_grad, filter_testset_std_abs_grad = find_testset_saliency(
+            net, testset, 'filter_wise', task_adapter, target_spec, signed=args.signed,
+        )
+        torch.save(
+            {'mean': filter_testset_mean_abs_grad, 'std': filter_testset_std_abs_grad},
+            filter_stats_file,
+        )
     else:
-        warnings.warn("Computing testset stats, check the names of saved stats files if this was not intended")
-        filter_testset_mean_abs_grad, filter_testset_std_abs_grad = find_testset_saliency(net, testset, 'filter_wise', args)
-        torch.save({'mean': filter_testset_mean_abs_grad, 'std': filter_testset_std_abs_grad}, filter_stats_file)
+        filter_testset_mean_abs_grad = None
+        filter_testset_std_abs_grad  = None
 
+    # ------------------------------------------------------------------ #
+    # Reference image                                                      #
+    # ------------------------------------------------------------------ #
     if args.reference_id is None:
-        print("""\n
-        Using image {}
-        and target label {}\n
-        """.format(args.image_path, args.image_target_label))
-        reference_image = transform_raw_image(args.image_path).unsqueeze(0)
+        print(f'\n  Using image {args.image_path} with target label {args.image_target_label}\n')
+        reference_image  = transform_raw_image(
+            args.image_path, preprocess=transform_test
+        ).unsqueeze(0)
         reference_target = torch.tensor(int(args.image_target_label)).unsqueeze(0)
     else:
-        print("""\n
-        Using reference_id to select the image for the experiment. 
-        Working with {}-th image from ImageNet validation set and its target label.
-        If this was intended, please make sure to specify path to ImageNet validation set.
-        If using an image from raw_images/ was intended, please do not specify 
-        --reference_id and use --image_target_label and --image_path args instead.
-        """.format(args.reference_id))
+        print(f'\n  Using {args.reference_id}-th image from the validation set.\n')
         reference_image, reference_target = testset.__getitem__(args.reference_id)
         reference_target = torch.tensor(reference_target).unsqueeze(0)
         reference_image.unsqueeze_(0)
 
+    # ------------------------------------------------------------------ #
+    # Compute saliency                                                     #
+    # ------------------------------------------------------------------ #
+    grads_to_save, filter_saliency = compute_input_space_saliency(
+        reference_image, reference_target, net, args,
+        task_adapter, target_spec,
+        filter_testset_mean_abs_grad, filter_testset_std_abs_grad,
+        inv_transform_test, readable_labels,
+    )
 
-    grads_to_save, filter_saliency = compute_input_space_saliency(reference_image, reference_target, net, args, experiment, filter_testset_mean_abs_grad, filter_testset_std_abs_grad, inv_transform_test, readable_labels)
+    layer_sorted_profile, _ = sort_filters_layer_wise(
+        filter_saliency.detach().cpu().numpy(), layer_to_filter_id,
+    )
 
-    layer_sorted_profile, sal_means = sort_filters_layer_wise(
-        filter_saliency.detach().cpu().numpy(), layer_to_filter_id)
-    #Save input space saliency:
-    save_gradients(grads_to_save, args, experiment, reference_image, inv_transform_test)
+    # ------------------------------------------------------------------ #
+    # Save results                                                         #
+    # ------------------------------------------------------------------ #
+    save_gradients(grads_to_save, args, reference_image, inv_transform_test)
 
-    #Plot and save parameter saliency
     fig, ax = plt.subplots(1, 1, figsize=(15, 4))
-    ax.spines["right"].set_visible(False)
-    ax.spines["top"].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.spines['top'].set_visible(False)
     pal = sns.color_palette('colorblind')
-    blue_color = pal.as_hex()[0]
-    orange_color = pal.as_hex()[1]
-    ax.plot(layer_sorted_profile, label='Sorted filter saliency', c=blue_color)  # '0.25')
+    ax.plot(layer_sorted_profile, label='Sorted filter saliency', c=pal.as_hex()[0])
     ax.legend()
     ax.get_legend().get_frame().set_alpha(0.0)
     ax.set_xlabel('Filter ID')
     ax.set_ylabel('Saliency')
-    save_name = str(args.reference_id) if args.reference_id is not None else args.image_path.split('/')[-1].split('.')[0]
-    save_name += '_' + args.model
-    fig.savefig(os.path.join(args.output_root, 'filter_saliency_{}.png'.format(save_name)))
-    print('Filter saliency saved to {}'.format(os.path.join(args.output_root, 'filter_saliency_{}.png'.format(save_name))))
-#Run this: python3 input_saliency.py --reference_id 107 --k_salient 10
-#Run this: python3 parameter_and_input_saliency.py --image_path raw_images/great_white_shark_mispred_as_killer_whale.jpeg --image_target_label 2
+
+    save_name = (str(args.reference_id) if args.reference_id is not None
+                 else args.image_path.split('/')[-1].split('.')[0])
+    save_name += '_' + ck
+    out_path = os.path.join(args.output_root, f'filter_saliency_{save_name}.png')
+    fig.savefig(out_path)
+    print(f'Filter saliency saved to {out_path}')
+#Run this: python3 parameter_and_input_saliency.py --model resnet50 --image_path raw_images/great_white_shark_mispred_as_killer_whale.jpeg --image_target_label 2

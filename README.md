@@ -37,20 +37,152 @@ Demo
 -----
 The demo raw image is in /raw_images. The results are in /figures.
 
+Using Custom Models
+-------------------
+The codebase is structured around three independent abstraction layers — **Model**, **Task**, and **Target** — so that any user-defined PyTorch model can be plugged in without touching the saliency engine.
+
+### Model layer
+
+The **Model** layer (`model_adapter/`) is responsible for model construction, weight loading, preprocessing, and defining what counts as one *saliency unit* (by default, one output filter of each Conv2d layer).
+
+Two adapters are provided:
+
+| Adapter | When to use |
+|---------|-------------|
+| `TorchvisionAdapter` | Any `torchvision.models` model by name (default) |
+| `CustomModuleAdapter` | Your own `nn.Module` class, loaded from a checkpoint |
+
+To run with a custom model, pass `--model_source custom_module` together with the fully-qualified class path and an optional checkpoint path:
+
+```bash
+python3 parameter_and_input_saliency.py \
+    --model_source custom_module \
+    --model_class_path mypkg.models.MyNet \
+    --model_weights_path checkpoints/mynet.pth \
+    --image_path raw_images/sample.jpg \
+    --image_target_label 0
+```
+
+If your model expects different input statistics, pass them via `preprocess_cfg` when constructing `CustomModuleAdapter` directly in Python:
+
+```python
+from model_adapter import CustomModuleAdapter
+
+adapter = CustomModuleAdapter(
+    class_path='mypkg.models.MyNet',
+    weights_path='checkpoints/mynet.pth',
+    preprocess_cfg={
+        'resize': 256, 'crop': 224,
+        'mean': [0.5, 0.5, 0.5],
+        'std':  [0.5, 0.5, 0.5],
+    },
+)
+```
+
+To define a custom saliency unit granularity (e.g. attention heads, FPN levels), subclass `ModelAdapter` and override `iter_saliency_units()`:
+
+```python
+from model_adapter.base import ModelAdapter
+
+class MyAdapter(ModelAdapter):
+    def build_model(self): ...
+    def get_preprocess(self): ...
+    def get_inv_preprocess(self): ...
+
+    def iter_saliency_units(self, model):
+        # Return {layer_name: [flat_filter_indices]} for any unit definition
+        ...
+```
+
+### Task layer
+
+The **Task** layer (`task_adapter/`) encapsulates how a forward pass is executed and how the objective (loss) is computed.  The current implementation provides `ClassificationTaskAdapter`, which uses `CrossEntropyLoss` on the resolved target.
+
+To support a new task (e.g. object detection), subclass `TaskAdapter`:
+
+```python
+from task_adapter.base import TaskAdapter
+
+class DetectionTaskAdapter(TaskAdapter):
+    def build_objective(self, model, inputs, true_labels, target_spec):
+        # compute task-specific loss and return (loss, resolved_targets)
+        ...
+
+    def summarize_prediction(self, model, inputs, true_labels, label_map):
+        ...
+```
+
+### Target layer
+
+The **Target** layer (`target/`) specifies *what* the saliency gradient is computed with respect to, independently of the model and task.
+
+Three target types are available via `--target_type`:
+
+| `--target_type` | Description |
+|-----------------|-------------|
+| `true_label` (default) | Ground-truth class label |
+| `predicted_top1` | Top-1 predicted class (useful for studying confident wrong predictions) |
+| `specified_class` | A fixed class id supplied via `--target_class_id` |
+
+Example — compute saliency with respect to a specific class:
+
+```bash
+python3 parameter_and_input_saliency.py \
+    --model resnet50 \
+    --image_path raw_images/great_white_shark_mispred_as_killer_whale.jpeg \
+    --image_target_label 2 \
+    --target_type specified_class \
+    --target_class_id 148
+```
+
+To add a new target type, add a value to `TargetType` in `target/spec.py` and handle it in `TargetResolver.resolve()` in `target/resolver.py`.
+
+### Label maps for custom models
+
+For torchvision models, ImageNet labels are downloaded automatically.  For custom models, provide a YAML file mapping integer class indices to human-readable names:
+
+```yaml
+# label_map.yaml
+0: cat
+1: dog
+2: bird
+```
+
+```bash
+python3 parameter_and_input_saliency.py \
+    --model_source custom_module \
+    --model_class_path mypkg.models.MyNet \
+    --label_map_path label_map.yaml \
+    --image_path raw_images/sample.jpg \
+    --image_target_label 0
+```
+
 Project Organization
 ------------
     ├── README.md
     ├── LICENSE
-    ├── requirements.txt 
-    ├── utils.py  <- helper functions       
-    ├── parameter_and_input_saliency.py  <- main script which computes both input saliency and parameter saliency
+    ├── requirements.txt
+    ├── utils.py  <- helper functions
+    ├── parameter_and_input_saliency.py  <- main script
+    │
+    ├── model_adapter/   <- Model layer: model construction, preprocessing, saliency-unit definition
+    │   ├── base.py               (ModelAdapter ABC)
+    │   ├── torchvision_adapter.py
+    │   ├── custom_module_adapter.py
+    │   └── factory.py            (build_model_adapter)
+    ├── task_adapter/    <- Task layer: forward pass and objective function
+    │   ├── base.py               (TaskAdapter ABC)
+    │   └── classification.py     (ClassificationTaskAdapter)
+    ├── target/          <- Target layer: saliency target specification and resolution
+    │   ├── spec.py               (TargetSpec, TargetType)
+    │   └── resolver.py           (TargetResolver)
     │
     ├── figures <- folder for resulting figures
-    ├── helper_objects <- precomputed objects to speed up computation (inference results on ImageNet valset and parameter saliency mean and std for standardization)
-    │   ├─ resnet50   
+    ├── helper_objects <- precomputed cache objects (inference results and saliency statistics)
+    │   ├─ resnet50
     │   ├─ densenet121
     │   ├─ inception_v3
     │   └── vgg19
-    ├── raw_images <- images to use for parameter space saliency computation and for input space saliency visualization
+    ├── raw_images <- images to use for parameter space saliency computation
     └── parameter_saliency
-        └── saliency_model_backprop  <- script with SaliencyModel class, parameter saliency implementation 
+        └── saliency_model_backprop.py  <- SaliencyModel class, parameter saliency engine

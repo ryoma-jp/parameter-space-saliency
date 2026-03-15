@@ -1,139 +1,181 @@
-
-import torch.autograd as autograd
-import torch
-import torch.nn as nn
-from utils import show_heatmap_on_image, AverageMeter
 import time
 
+import torch
+import torch.autograd as autograd
+import torch.nn as nn
+
+from utils import AverageMeter
+from target.spec import TargetSpec
+
 class SaliencyModel(nn.Module):
-    def __init__(self, net, criterion, device='cuda', mode='std', aggregation='filter_wise', signed=False, logit=False,
-                 logit_difference=False):
+    """Computes parameter-space saliency scores via backpropagation.
+
+    The objective (loss) is delegated to a TaskAdapter, which makes this
+    class task-agnostic.
+
+    Args:
+        net:          The model (may be DataParallel-wrapped).
+        task_adapter: Provides build_objective(model, inputs, labels, spec).
+        device:       'cuda' or 'cpu'.
+        mode:         'naive' | 'std' | 'norm'
+        aggregation:  'filter_wise' | 'parameter_wise'
+        signed:       Keep gradient sign when True.
+    """
+
+    def __init__(
+        self,
+        net,
+        task_adapter,
+        device: str = 'cuda',
+        mode: str = 'std',
+        aggregation: str = 'filter_wise',
+        signed: bool = False,
+    ):
         super(SaliencyModel, self).__init__()
-        self.net = net
-        self.criterion = criterion
-        self.device = device
-        self.mode = mode
-        self.aggregation = aggregation
-        self.signed = signed
-        self.logit = logit
-        self.logit_difference = logit_difference
+        self.net          = net
+        self.task_adapter = task_adapter
+        self.device       = device
+        self.mode         = mode
+        self.aggregation  = aggregation
+        self.signed       = signed
 
-    def forward(self, inputs, targets, target_to_subtract=None, testset_mean_abs_grad=None, testset_std_abs_grad=None):
-        # Turn on gradient for the input image
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        true_labels: torch.Tensor,
+        target_spec: TargetSpec,
+        testset_mean_abs_grad: torch.Tensor = None,
+        testset_std_abs_grad:  torch.Tensor = None,
+    ) -> torch.Tensor:
         inputs.requires_grad_()
-
-        # Set the net in eval mode
         self.net.eval()
-
-        inputs, targets = inputs.to(self.device), targets.to(self.device),
-
-        if  target_to_subtract is not None:
-            target_to_subtract = target_to_subtract.to(self.device)
-
+        inputs, true_labels = inputs.to(self.device), true_labels.to(self.device)
         self.net.zero_grad()
-        outputs = self.net(inputs)
 
-        if self.logit:
-            raise NotImplementedError
-            #loss = outputs[0][int(targets[0])]
-        elif self.logit_difference:
-            raise NotImplementedError
-            #loss = outputs[0][int(targets[0])] - outputs[0][int(target_to_subtract[0])]
-        else:
-            loss = self.criterion(outputs, targets)
+        loss, _ = self.task_adapter.build_objective(
+            self.net, inputs, true_labels, target_spec
+        )
 
-
-        gradients = autograd.grad(loss, self.net.parameters(), create_graph=True, allow_unused=True)
+        gradients = autograd.grad(
+            loss, self.net.parameters(),
+            create_graph=True, allow_unused=True,
+        )
 
         filter_grads = []
-        for i in range(len(gradients)):  # Filter-wise aggregation
-            # print(gradients[i].size())
-
+        for grad in gradients:
+            if grad is None:        # unused parameter — skip safely
+                continue
             if self.aggregation == 'filter_wise':
-                if len(gradients[i].size()) == 4:  # If conv layer
-                    if not self.signed:
-                        # first take abs and then aggregate
-                        filter_grads.append(gradients[i].abs().mean(-1).mean(-1).mean(-1))
+                if len(grad.size()) == 4:   # Conv2d weight
+                    if self.signed:
+                        agg = grad.mean(-1).mean(-1).mean(-1)
                     else:
-                        filter_grads.append(gradients[i].mean(-1).mean(-1).mean(-1))
-            if self.aggregation == 'parameter_wise':
-                if not self.signed:
-                    filter_grads.append(gradients[i].view(-1).abs())
-                else:
-                    filter_grads.append(gradients[i].view(-1))
-            if self.aggregation == 'tensor_wise':
-                raise NotImplementedError
+                        agg = grad.abs().mean(-1).mean(-1).mean(-1)
+                    filter_grads.append(agg)
+            elif self.aggregation == 'parameter_wise':
+                flat = grad.view(-1)
+                filter_grads.append(flat if self.signed else flat.abs())
+            elif self.aggregation == 'tensor_wise':
+                raise NotImplementedError("tensor_wise aggregation is not yet implemented.")
 
-        if not self.signed:
-            naive_saliency = torch.abs(torch.cat(filter_grads))
-        else:
-            naive_saliency = torch.cat(filter_grads)
+        naive_saliency = torch.cat(filter_grads)
+
         if self.mode == 'naive':
             return naive_saliency
-        if self.mode == 'std':
-            testset_std_abs_grad[testset_std_abs_grad <= 1e-14] = 1  # This should fix nans in the resulting parameter_saliency
-            std_saliency = (naive_saliency - testset_mean_abs_grad.to(self.device)) / testset_std_abs_grad.to(
-                self.device)
-            return std_saliency
-        if self.mode == 'norm':
-            testset_mean_abs_grad[testset_mean_abs_grad <= 1e-14] = 1
-            norm_saliency = naive_saliency / testset_mean_abs_grad.to(self.device)
-            return norm_saliency
 
-def find_testset_saliency(net, testset, aggregation, args):
-    """find_saliency is a basic parameter_saliency method: could be naive, could be averaging across filters, tensors, layers, etc
-    Return average magnitude of gradient across samples in the testset and std of that"""
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    # This local testloader should have batch size 1, but we can do more for quick debugging
+        if self.mode == 'std':
+            # Clone to avoid mutating the cached statistics tensor in-place
+            std = testset_std_abs_grad.clone().to(self.device)
+            std[std <= 1e-14] = 1.0
+            return (naive_saliency - testset_mean_abs_grad.to(self.device)) / std
+
+        if self.mode == 'norm':
+            mean = testset_mean_abs_grad.clone().to(self.device)
+            mean[mean <= 1e-14] = 1.0
+            return naive_saliency / mean
+
+        raise ValueError(f"Unknown saliency mode: '{self.mode}'. "
+                         "Choose 'naive', 'std', or 'norm'.")
+
+
+def find_testset_saliency(net, testset, aggregation, task_adapter, target_spec, signed=False):
+    """Compute mean and std of filter-wise saliency across the testset.
+
+    Uses Welford's online algorithm to update mean and variance
+    incrementally, avoiding excessive memory allocation.
+
+    Args:
+        net:          The model.
+        testset:      A dataset compatible with DataLoader.
+        aggregation:  Aggregation strategy (see SaliencyModel).
+        task_adapter: Task adapter that provides the objective function.
+        target_spec:  Target specification used for gradient computation.
+        signed:       Whether to keep gradient signs.
+
+    Returns:
+        (testset_mean_abs_grad, testset_std_abs_grad) as float64 tensors.
+    """
+    device     = 'cuda' if torch.cuda.is_available() else 'cpu'
     testloader = torch.utils.data.DataLoader(testset, batch_size=1, num_workers=2)
 
-    # Go through images one by one, cannot go in batches since we need avg abs grad, not just avg grad
-    # Incrementally compute the mean and std to not run out of memory
-    iter_time = AverageMeter()
-    end = time.time()
-    for batch_idx, (testset_inputs, testset_targets) in enumerate(testloader):
-        testset_inputs, testset_targets = testset_inputs.to(device), testset_targets.to(device)
-        testset_outputs = net(testset_inputs)
-        _, testset_predicted = testset_outputs.max(1)
+    saliency_model = SaliencyModel(
+        net, task_adapter,
+        device=device, mode='naive',
+        aggregation=aggregation, signed=signed,
+    )
 
-        filter_saliency_model = SaliencyModel(net, nn.CrossEntropyLoss(), device='cuda', mode='naive',
-                                              aggregation=aggregation, signed=args.signed, logit=args.logit,
-                                              logit_difference=args.logit_difference)
-        testset_grad = filter_saliency_model(testset_inputs, testset_targets).detach().to(device)
+    iter_time = AverageMeter()
+    end       = time.time()
+    testset_mean_abs_grad = None
+    testset_std_abs_grad  = None
+
+    for batch_idx, (testset_inputs, testset_targets) in enumerate(testloader):
+        testset_inputs  = testset_inputs.to(device)
+        testset_targets = testset_targets.to(device)
+
+        testset_grad = saliency_model(
+            testset_inputs, testset_targets, target_spec
+        ).detach().double().to(device)
 
         if batch_idx == 0:
-            # oldM in Welford's method (https://jonisalonen.com/2013/deriving-welfords-method-for-computing-variance/)
-            testset_mean_abs_grad_prev = torch.zeros_like(testset_grad, dtype=torch.float64)
-            testset_mean_abs_grad = testset_grad / float(batch_idx + 1)
-            # print(testset_mean_abs_grad)
-            testset_std_abs_grad = (testset_grad - testset_mean_abs_grad) * (testset_grad - testset_mean_abs_grad_prev)
+            testset_mean_abs_grad_prev = torch.zeros_like(testset_grad)
+            testset_mean_abs_grad      = testset_grad.clone()
+            testset_std_abs_grad       = (
+                (testset_grad - testset_mean_abs_grad)
+                * (testset_grad - testset_mean_abs_grad_prev)
+            )
         else:
-            testset_mean_abs_grad_prev = testset_mean_abs_grad.detach().clone()  # oldM
-            testset_mean_abs_grad += (testset_grad - testset_mean_abs_grad) / float(
-                batch_idx + 1)  # update M to the current
-            # print(testset_mean_abs_grad)
-            testset_std_abs_grad += (testset_grad - testset_mean_abs_grad) * (
-                    testset_grad - testset_mean_abs_grad_prev)  # update variance
-            # print(testset_std_abs_grad)
+            testset_mean_abs_grad_prev  = testset_mean_abs_grad.detach().clone()
+            testset_mean_abs_grad      += (
+                (testset_grad - testset_mean_abs_grad) / float(batch_idx + 1)
+            )
+            testset_std_abs_grad       += (
+                (testset_grad - testset_mean_abs_grad)
+                * (testset_grad - testset_mean_abs_grad_prev)
+            )
 
         iter_time.update(time.time() - end)
         end = time.time()
         if (batch_idx + 1) % 50 == 0:
-            remain_time = (len(testloader) - batch_idx - 1) * iter_time.avg
-            t_m, t_s = divmod(remain_time, 60)
-            t_h, t_m = divmod(t_m, 60)
-            remain_time = '{:02d}:{:02d}:{:02d}'.format(int(t_h), int(t_m), int(t_s))
-            print("ITer: [{:d}/{:d}]\t iter time: {iter_time.val: .3f}\t remain time: {remain_time}".format(
-                batch_idx + 1, len(testloader), iter_time=iter_time, remain_time=remain_time))
+            remain  = (len(testloader) - batch_idx - 1) * iter_time.avg
+            h, rem  = divmod(remain, 3600)
+            m, s    = divmod(rem, 60)
+            print(
+                f"Iter: [{batch_idx + 1}/{len(testloader)}]  "
+                f"iter_time: {iter_time.val:.3f}  "
+                f"remain: {int(h):02d}:{int(m):02d}:{int(s):02d}"
+            )
 
-    testset_std_abs_grad = testset_std_abs_grad / float(len(testloader) - 1)  # Unbiased estimator of variance
-    print('Variance:', testset_std_abs_grad)
+    # Finalise variance → std  (unbiased estimator)
+    testset_std_abs_grad = testset_std_abs_grad / float(len(testloader) - 1)
     testset_std_abs_grad = torch.sqrt(testset_std_abs_grad)
-    print('Std:', testset_std_abs_grad)
-    print('Mean:', testset_mean_abs_grad)
-    print('Testset_grads_shape:{}'.format(testset_mean_abs_grad.shape))
+
+    print('Std:   ', testset_std_abs_grad)
+    print('Mean:  ', testset_mean_abs_grad)
+    print('Shape: ', testset_mean_abs_grad.shape)
 
     return testset_mean_abs_grad, testset_std_abs_grad
+
 
 if __name__ == '__main__':
     pass
