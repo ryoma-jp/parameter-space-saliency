@@ -15,6 +15,7 @@ from utils import show_heatmap_on_image, test_and_find_incorrectly_classified, t
 from parameter_saliency.saliency_model_backprop import SaliencyModel, find_testset_saliency
 from model_adapter.factory import build_model_adapter
 from task_adapter.classification import ClassificationTaskAdapter
+from task_adapter.detection import DetectionTaskAdapter
 from target.spec import TargetSpec, TargetType
 
 parser = argparse.ArgumentParser(description='Parameter-Space and Input-Space Saliency')
@@ -31,6 +32,8 @@ parser.add_argument('--model_weights_path', default=None, type=str,
                     help='path to weights checkpoint for custom_module')
 parser.add_argument('--export_model_pth', default=None, type=str,
                     help='export the loaded model weights to a .pth checkpoint and continue execution')
+parser.add_argument('--task', default='classification', choices=['classification', 'detection'],
+                    help='task adapter to use for objective construction')
 
 # ----- Dataset -----
 parser.add_argument('--data_to_use', default='ImageNet', type=str,
@@ -141,7 +144,7 @@ def _export_model_checkpoint(model, args) -> None:
 
 def save_gradients(grads_to_save, args, reference_image, inv_transform_test):
     grads_to_save, _ = grads_to_save.max(dim=1)
-    grads_to_save = grads_to_save.detach().cpu().numpy().reshape((224, 224))
+    grads_to_save = grads_to_save[0].detach().cpu().numpy()
     grads_to_save = np.abs(grads_to_save)
     # grads_to_save[grads_to_save < 0] = 0.0
 
@@ -183,6 +186,10 @@ def compute_input_space_saliency(
     inv_transform_test=None, readable_labels=None,
 ):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    saliency_mode = 'std'
+    if testset_mean_stat is None or testset_std_stat is None:
+        saliency_mode = 'naive'
+        print('Testset saliency statistics are unavailable; falling back to naive saliency mode.')
 
     # Log prediction summary via TaskAdapter
     task_adapter.summarize_prediction(
@@ -194,7 +201,7 @@ def compute_input_space_saliency(
 
     filter_saliency_model = SaliencyModel(
         net, task_adapter,
-        device=device, mode='std',
+        device=device, mode=saliency_mode,
         aggregation='filter_wise', signed=args.signed,
     )
     reference_inputs  = reference_inputs.to(device)
@@ -295,7 +302,10 @@ if __name__ == '__main__':
     # ------------------------------------------------------------------ #
     # Task & target                                                        #
     # ------------------------------------------------------------------ #
-    task_adapter = ClassificationTaskAdapter()
+    if args.task == 'classification':
+        task_adapter = ClassificationTaskAdapter()
+    else:
+        task_adapter = DetectionTaskAdapter()
     target_spec  = TargetSpec.from_args(args.target_type, args.target_class_id)
 
     # ------------------------------------------------------------------ #
@@ -387,7 +397,15 @@ if __name__ == '__main__':
         reference_image  = transform_raw_image(
             args.image_path, preprocess=transform_test
         ).unsqueeze(0)
-        reference_target = torch.tensor(int(args.image_target_label)).unsqueeze(0)
+        if args.image_target_label is None:
+            if args.target_type == TargetType.SPECIFIED_CLASS.value:
+                fallback_target = int(args.target_class_id)
+            else:
+                fallback_target = 0
+                print('No --image_target_label was provided; using 0 as fallback target label.')
+        else:
+            fallback_target = int(args.image_target_label)
+        reference_target = torch.tensor(fallback_target).unsqueeze(0)
     else:
         print(f'\n  Using {args.reference_id}-th image from the validation set.\n')
         reference_image, reference_target = testset.__getitem__(args.reference_id)

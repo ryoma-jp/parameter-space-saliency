@@ -262,19 +262,27 @@ Status legend:
 
 | ID | Task | Status | Owner | Last update | Notes |
 |----|------|--------|-------|-------------|-------|
-| 1 | Implement `DetectionTaskAdapter` and task selection CLI | TODO | - | - | |
-| 2 | Add YOLOX Tiny wrapper class and validate checkpoint loading | TODO | - | - | |
-| 3 | Wire end-to-end saliency run for one raw image | TODO | - | - | |
-| 4 | Remove fixed-size assumptions in gradient visualization | TODO | - | - | |
-| 5 | Add cache/statistics fallback behavior for detection-only usage | TODO | - | - | |
-| 6 | Update and validate `scripts/run_yolox_tiny_custom_model.sh` in Docker | TODO | - | - | |
-| 7 | Run regression check for classification workflow | TODO | - | - | |
+| 1 | Implement `DetectionTaskAdapter` and task selection CLI | DONE | Copilot | 2026-03-16 | Added `task_adapter/detection.py` and `--task` dispatch in main script. |
+| 2 | Add YOLOX Tiny wrapper class and validate checkpoint loading | DONE | Copilot | 2026-03-16 | Added `model_adapter/yolox_tiny_wrapper.py` with robust key-prefix loading. |
+| 3 | Wire end-to-end saliency run for one raw image | DONE | Copilot | 2026-03-16 | Executed `bash scripts/run_yolox_tiny_custom_model.sh` and generated outputs. |
+| 4 | Remove fixed-size assumptions in gradient visualization | DONE | Copilot | 2026-03-16 | Replaced fixed `(224,224)` reshape with dynamic tensor shape handling. |
+| 5 | Add cache/statistics fallback behavior for detection-only usage | DONE | Copilot | 2026-03-16 | Added fallback to `naive` mode when testset stats are unavailable. |
+| 6 | Update and validate `scripts/run_yolox_tiny_custom_model.sh` in Docker | DONE | Copilot | 2026-03-16 | Updated to YOLOX Tiny detection config and validated successful run. |
+| 7 | Run regression check for classification workflow | DONE | User | 2026-03-17 | User executed the regression test and confirmed no issues. |
 
 Optional change log template:
 
 ```text
 [YYYY-MM-DD] [ID] [STATUS] summary
 example: [2026-03-16] [2] [DOING] implemented YOLOX Tiny wrapper, loading test in progress
+
+[2026-03-16] [1] [DONE] added DetectionTaskAdapter and task selection CLI
+[2026-03-16] [2] [DONE] added YOLOX Tiny wrapper and fixed checkpoint key compatibility
+[2026-03-16] [3] [DONE] completed one-image E2E detection saliency run
+[2026-03-16] [4] [DONE] made gradient visualization shape-dynamic
+[2026-03-16] [5] [DONE] added saliency stats fallback to naive mode
+[2026-03-16] [6] [DONE] updated and validated YOLOX Tiny custom-model run script
+[2026-03-17] [7] [DONE] user ran the classification regression test and confirmed no issues
 ```
 
 Validation criteria:
