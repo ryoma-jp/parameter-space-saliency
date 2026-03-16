@@ -1,4 +1,5 @@
 import importlib
+import sys
 from typing import Optional, Tuple
 
 import torch
@@ -45,20 +46,36 @@ class CustomModuleAdapter(ModelAdapter):
         weights_path: Optional[str] = None,
         preprocess_cfg: Optional[dict] = None,
         model_kwargs: Optional[dict] = None,
+        import_roots: Optional[list] = None,
+        state_dict_target_path: Optional[str] = None,
     ):
         self.class_path     = class_path
         self.weights_path   = weights_path
         self.preprocess_cfg = preprocess_cfg or {}
         self.model_kwargs   = model_kwargs   or {}
+        self.import_roots   = import_roots   or []
+        self.state_dict_target_path = state_dict_target_path
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
     def _load_class(self):
+        for root in reversed(self.import_roots):
+            if root and root not in sys.path:
+                sys.path.insert(0, root)
         module_path, class_name = self.class_path.rsplit('.', 1)
         module = importlib.import_module(module_path)
         return getattr(module, class_name)
+
+    def _resolve_state_dict_target(self, model: nn.Module) -> nn.Module:
+        if not self.state_dict_target_path:
+            return model
+
+        target = model
+        for attr in self.state_dict_target_path.split('.'):
+            target = getattr(target, attr)
+        return target
 
     def _mean_std(self) -> Tuple[tuple, tuple]:
         mean = tuple(self.preprocess_cfg.get('mean', self._DEFAULT_MEAN))
@@ -72,6 +89,11 @@ class CustomModuleAdapter(ModelAdapter):
     def build_model(self) -> nn.Module:
         cls   = self._load_class()
         model = cls(**self.model_kwargs)
+        if not isinstance(model, nn.Module):
+            raise TypeError(
+                f"Resolved object '{self.class_path}' must construct and return nn.Module, "
+                f"got {type(model)!r}."
+            )
 
         if self.weights_path is not None:
             checkpoint = torch.load(self.weights_path, map_location='cpu')
@@ -83,26 +105,40 @@ class CustomModuleAdapter(ModelAdapter):
                 )
             else:
                 state_dict = checkpoint
-            model.load_state_dict(state_dict)
+            self._resolve_state_dict_target(model).load_state_dict(state_dict)
 
         return model
 
     def get_preprocess(self) -> transforms.Compose:
         resize    = self.preprocess_cfg.get('resize', 256)
         crop      = self.preprocess_cfg.get('crop',   224)
+        normalize = self.preprocess_cfg.get('normalize', True)
+        scale     = float(self.preprocess_cfg.get('scale', 1.0))
         mean, std = self._mean_std()
-        return transforms.Compose([
-            transforms.Resize(resize),
-            transforms.CenterCrop(crop),
-            transforms.ToTensor(),
-            transforms.Normalize(mean, std),
-        ])
+
+        transform_ops = [transforms.Resize(resize)]
+        if crop is not None:
+            transform_ops.append(transforms.CenterCrop(crop))
+        transform_ops.append(transforms.ToTensor())
+        if scale != 1.0:
+            transform_ops.append(transforms.Lambda(lambda tensor: tensor * scale))
+        if normalize:
+            transform_ops.append(transforms.Normalize(mean, std))
+        return transforms.Compose(transform_ops)
 
     def get_inv_preprocess(self) -> transforms.Compose:
         mean, std = self._mean_std()
+        normalize = self.preprocess_cfg.get('normalize', True)
+        scale     = float(self.preprocess_cfg.get('scale', 1.0))
         inv_std   = tuple(1.0 / s for s in std)
         inv_mean  = tuple(-m for m in mean)
-        return transforms.Compose([
-            transforms.Normalize(mean=(0., 0., 0.), std=inv_std),
-            transforms.Normalize(mean=inv_mean,    std=(1., 1., 1.)),
-        ])
+
+        transform_ops = []
+        if normalize:
+            transform_ops.extend([
+                transforms.Normalize(mean=(0., 0., 0.), std=inv_std),
+                transforms.Normalize(mean=inv_mean,    std=(1., 1., 1.)),
+            ])
+        if scale != 1.0:
+            transform_ops.append(transforms.Lambda(lambda tensor: tensor / scale))
+        return transforms.Compose(transform_ops)

@@ -1,4 +1,5 @@
 import yaml
+import json
 import urllib
 import torch
 import torch.backends.cudnn as cudnn
@@ -30,6 +31,14 @@ parser.add_argument('--model_class_path', default=None, type=str,
                     help='fully-qualified class path for custom_module, e.g. mypkg.models.MyNet')
 parser.add_argument('--model_weights_path', default=None, type=str,
                     help='path to weights checkpoint for custom_module')
+parser.add_argument('--model_import_root', action='append', default=[],
+                    help='extra import root to prepend before resolving --model_class_path; repeatable')
+parser.add_argument('--model_kwargs_json', default=None, type=str,
+                    help='JSON object with keyword args passed to the custom model constructor/factory')
+parser.add_argument('--preprocess_cfg_json', default=None, type=str,
+                    help='JSON object overriding preprocessing, e.g. {"resize":[416,416],"crop":null}')
+parser.add_argument('--state_dict_target_path', default=None, type=str,
+                    help='optional dotted attribute path under the constructed model to receive load_state_dict')
 parser.add_argument('--export_model_pth', default=None, type=str,
                     help='export the loaded model weights to a .pth checkpoint and continue execution')
 parser.add_argument('--task', default='classification', choices=['classification', 'detection'],
@@ -118,6 +127,14 @@ def _build_model_spec(args) -> dict:
     spec = {'source': 'custom_module', 'class_path': args.model_class_path}
     if args.model_weights_path:
         spec['weights_path'] = args.model_weights_path
+    if args.model_import_root:
+        spec['import_roots'] = args.model_import_root
+    if args.model_kwargs_json:
+        spec['model_kwargs'] = json.loads(args.model_kwargs_json)
+    if args.preprocess_cfg_json:
+        spec['preprocess'] = json.loads(args.preprocess_cfg_json)
+    if args.state_dict_target_path:
+        spec['state_dict_target_path'] = args.state_dict_target_path
     return spec
 
 

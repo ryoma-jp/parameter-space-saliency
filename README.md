@@ -75,6 +75,50 @@ python3 parameter_and_input_saliency.py \
     --image_target_label 0
 ```
 
+`CustomModuleAdapter` also supports a more model-independent pattern where
+`--model_class_path` points to any importable callable that returns an `nn.Module`.
+This is useful when the model already has a factory function and you want to avoid
+writing a model-specific wrapper.
+
+Example: build YOLOX Tiny directly from the vendored YOLOX package via a generic
+factory callable, without adding any model-specific wrapper:
+
+```bash
+python3 parameter_and_input_saliency.py \
+    --task detection \
+    --model_source custom_module \
+    --model_import_root /work/externals/YOLOX \
+    --model_class_path yolox.models.build.yolox_custom \
+    --model_kwargs_json '{"exp_path":"/work/externals/YOLOX/exps/default/yolox_tiny.py","ckpt_path":"externals/YOLOX/weights/yolox_tiny.pth","device":"cpu"}' \
+    --preprocess_cfg_json '{"resize":[416,416],"crop":null,"normalize":false,"scale":255.0}' \
+    --image_path raw_images/sample.jpg \
+    --target_type predicted_top1
+```
+
+#### Why `--model_kwargs_json` and `--preprocess_cfg_json` vary across models
+
+`--model_kwargs_json` is forwarded as constructor/factory arguments to `--model_class_path`.
+Different model types have different construction requirements:
+
+| Model type | Constructor signature | `--model_kwargs_json` needed? | Example |
+|-----------|-------------|------|---------|
+| Simple `nn.Module` class | No required factory arguments | ✗ No | `torchvision.models.resnet50()` — works with defaults |
+| Factory function with required config | Requires configuration parameters | ✓ Yes | Any factory function expecting `exp_path`, `config_file`, or similar required arguments |
+
+Similarly, `--preprocess_cfg_json` encodes input preprocessing (resize/crop/normalize/scale).
+Models trained on different datasets or with different input sizes may require custom preprocessing:
+- Models matching ImageNet conventions → use defaults (256→224 resize/crop with ImageNet normalization)
+- Models with custom input requirements → specify custom preprocessing via JSON
+
+Supported `custom_module` CLI extensions:
+
+| Option | Purpose |
+|--------|---------|
+| `--model_import_root` | prepend extra import roots before resolving `--model_class_path` |
+| `--model_kwargs_json` | JSON object forwarded to the constructor/factory |
+| `--preprocess_cfg_json` | JSON object configuring resize/crop/normalize/scale |
+| `--state_dict_target_path` | dotted attribute path for nested `load_state_dict()` targets |
+
 If your model expects different input statistics, pass them via `preprocess_cfg` when constructing `CustomModuleAdapter` directly in Python:
 
 ```python
@@ -90,6 +134,20 @@ adapter = CustomModuleAdapter(
     },
 )
 ```
+
+When you still need a wrapper:
+
+1. The model cannot be built by a single importable callable.
+2. The checkpoint format requires custom key remapping or partial loading.
+3. The model needs bespoke forward-time input conversion beyond `resize`, `crop`, `normalize`, and `scale`.
+4. Saliency units must be defined in a model-specific way that does not match the default Conv2d filter grouping.
+
+Minimal wrapper guidelines:
+
+1. Keep the wrapper small and focused on model construction and checkpoint compatibility.
+2. Return a plain `nn.Module` from the wrapper constructor or factory.
+3. Prefer generic CLI config (`--model_kwargs_json`, `--preprocess_cfg_json`, `--state_dict_target_path`) before adding wrapper-only logic.
+4. If saliency units differ from Conv2d filters, prefer a custom `ModelAdapter` over embedding that policy in the wrapper.
 
 To define a custom saliency unit granularity (e.g. attention heads, FPN levels), subclass `ModelAdapter` and override `iter_saliency_units()`:
 
@@ -196,8 +254,9 @@ Use the existing Model/Task/Target separation and extend only the task-specific 
 
 1. Model layer:
     - Keep `model_source=custom_module`.
-    - Add a small YOLOX wrapper class that builds Tiny from YOLOX Exp and loads
-      `yolox_tiny.pth` (`model` key or raw `state_dict`).
+        - Prefer importable model factories plus CLI-supplied `model_kwargs_json` /
+            `preprocess_cfg_json` to avoid model-specific wrappers.
+        - Add a wrapper only when factory-based loading and generic preprocessing are insufficient.
     - Keep saliency unit extraction default (Conv2d output filters) for the first milestone.
 
 2. Task layer:
@@ -229,12 +288,12 @@ Proposed concrete changes:
     - Instantiate adapter by task type.
     - Make `save_gradients()` shape-dynamic (no fixed 224x224).
     - Add safe fallback from std mode to naive mode when statistics are missing.
-4. Add YOLOX custom-model wrapper module in this repository.
-    - Build model via YOLOX Exp (Tiny config).
-    - Load checkpoint from `externals/YOLOX/weights/yolox_tiny.pth`.
+4. Configure YOLOX Tiny through a generic callable path.
+    - Build model via `yolox.models.build.yolox_custom`.
+    - Pass Exp path and checkpoint path through `--model_kwargs_json`.
 5. Update `scripts/run_yolox_tiny_custom_model.sh`.
     - Point weights path to YOLOX Tiny checkpoint.
-    - Use `--task detection` and wrapper class path.
+    - Use `--task detection` and a generic callable path.
     - Ensure YOLOX import path is available via `PYTHONPATH` in Docker execution.
 
 #### 4) Step-by-step implementation plan
@@ -242,7 +301,7 @@ Proposed concrete changes:
 Recommended sequence:
 
 1. Implement `DetectionTaskAdapter` and task selection CLI.
-2. Add YOLOX Tiny wrapper class and validate checkpoint loading only.
+2. Add model-independent YOLOX Tiny loading and validate checkpoint loading only.
 3. Wire end-to-end saliency run for one raw image (no ImageNet val dependency).
 4. Remove fixed-size assumptions in gradient visualization.
 5. Add cache/statistics fallback behavior for detection-only usage.
@@ -263,7 +322,7 @@ Status legend:
 | ID | Task | Status | Owner | Last update | Notes |
 |----|------|--------|-------|-------------|-------|
 | 1 | Implement `DetectionTaskAdapter` and task selection CLI | DONE | Copilot | 2026-03-16 | Added `task_adapter/detection.py` and `--task` dispatch in main script. |
-| 2 | Add YOLOX Tiny wrapper class and validate checkpoint loading | DONE | Copilot | 2026-03-16 | Added `model_adapter/yolox_tiny_wrapper.py` with robust key-prefix loading. |
+| 2 | Add model-independent YOLOX Tiny loading path and validate checkpoint loading | DONE | Copilot | 2026-03-17 | Replaced wrapper-based loading with generic callable-based loading via `yolox.models.build.yolox_custom`. |
 | 3 | Wire end-to-end saliency run for one raw image | DONE | Copilot | 2026-03-16 | Executed `bash scripts/run_yolox_tiny_custom_model.sh` and generated outputs. |
 | 4 | Remove fixed-size assumptions in gradient visualization | DONE | Copilot | 2026-03-16 | Replaced fixed `(224,224)` reshape with dynamic tensor shape handling. |
 | 5 | Add cache/statistics fallback behavior for detection-only usage | DONE | Copilot | 2026-03-16 | Added fallback to `naive` mode when testset stats are unavailable. |
@@ -274,10 +333,10 @@ Optional change log template:
 
 ```text
 [YYYY-MM-DD] [ID] [STATUS] summary
-example: [2026-03-16] [2] [DOING] implemented YOLOX Tiny wrapper, loading test in progress
+example: [2026-03-16] [2] [DOING] implemented generic YOLOX Tiny loading, validation in progress
 
 [2026-03-16] [1] [DONE] added DetectionTaskAdapter and task selection CLI
-[2026-03-16] [2] [DONE] added YOLOX Tiny wrapper and fixed checkpoint key compatibility
+[2026-03-17] [2] [DONE] replaced YOLOX-specific wrapper with generic callable-based loading
 [2026-03-16] [3] [DONE] completed one-image E2E detection saliency run
 [2026-03-16] [4] [DONE] made gradient visualization shape-dynamic
 [2026-03-16] [5] [DONE] added saliency stats fallback to naive mode

@@ -16,9 +16,11 @@ def build_model_adapter(spec: Dict[str, Any]) -> ModelAdapter:
         Optional keys: ``pretrained`` (default ``True``).
 
     ``'custom_module'``
-        Load a user-defined ``nn.Module`` from a fully-qualified class path.
+        Load a user-defined ``nn.Module`` from a fully-qualified class path or
+        factory callable path.
         Required keys: ``class_path``.
-        Optional keys: ``weights_path``, ``preprocess``, ``model_kwargs``.
+        Optional keys: ``weights_path``, ``preprocess``, ``model_kwargs``,
+        ``import_roots``, ``state_dict_target_path``.
 
     Examples::
 
@@ -57,6 +59,8 @@ def build_model_adapter(spec: Dict[str, Any]) -> ModelAdapter:
             weights_path=spec.get('weights_path'),
             preprocess_cfg=spec.get('preprocess'),
             model_kwargs=spec.get('model_kwargs'),
+            import_roots=spec.get('import_roots'),
+            state_dict_target_path=spec.get('state_dict_target_path'),
         )
 
     raise ValueError(
