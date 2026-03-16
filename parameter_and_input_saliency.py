@@ -29,6 +29,8 @@ parser.add_argument('--model_class_path', default=None, type=str,
                     help='fully-qualified class path for custom_module, e.g. mypkg.models.MyNet')
 parser.add_argument('--model_weights_path', default=None, type=str,
                     help='path to weights checkpoint for custom_module')
+parser.add_argument('--export_model_pth', default=None, type=str,
+                    help='export the loaded model weights to a .pth checkpoint and continue execution')
 
 # ----- Dataset -----
 parser.add_argument('--data_to_use', default='ImageNet', type=str,
@@ -114,6 +116,27 @@ def _build_model_spec(args) -> dict:
     if args.model_weights_path:
         spec['weights_path'] = args.model_weights_path
     return spec
+
+
+def _export_model_checkpoint(model, args) -> None:
+    """Export the loaded model as a checkpoint compatible with CustomModuleAdapter."""
+    if not args.export_model_pth:
+        return
+
+    export_dir = os.path.dirname(args.export_model_pth)
+    if export_dir:
+        os.makedirs(export_dir, exist_ok=True)
+
+    checkpoint = {
+        'state_dict': model.state_dict(),
+        'model_source': args.model_source,
+        'model_spec': _build_model_spec(args),
+    }
+    if args.model_source == 'custom_module':
+        checkpoint['model_class_path'] = args.model_class_path
+
+    torch.save(checkpoint, args.export_model_pth)
+    print(f'Exported loaded model checkpoint to {args.export_model_pth}')
 
 
 def save_gradients(grads_to_save, args, reference_image, inv_transform_test):
@@ -251,6 +274,7 @@ if __name__ == '__main__':
     print('==> Building model..')
     adapter = build_model_adapter(_build_model_spec(args))
     net     = adapter.build_model()
+    _export_model_checkpoint(net, args)
 
     # Saliency units: derived BEFORE DataParallel to keep layer names clean
     layer_to_filter_id = adapter.iter_saliency_units(net)

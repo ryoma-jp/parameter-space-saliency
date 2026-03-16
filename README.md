@@ -33,6 +33,18 @@ here --reference_id specifies the image id from ImageNet validation set
 
 The resulting plots (input space colormap and filter saliency plot) will be saved to /figures
 
+To export the loaded model weights to a `.pth` checkpoint while running the script, pass `--export_model_pth`:
+
+```bash
+python3 parameter_and_input_saliency.py \
+    --model resnet50 \
+    --image_path raw_images/great_white_shark_mispred_as_killer_whale.jpeg \
+    --image_target_label 2 \
+    --export_model_pth checkpoints/resnet50_exported.pth
+```
+
+The exported file is model-agnostic and stores a `state_dict` under the `state_dict` key, plus minimal metadata about how the model was loaded.
+
 Demo
 -----
 The demo raw image is in /raw_images. The results are in /figures.
