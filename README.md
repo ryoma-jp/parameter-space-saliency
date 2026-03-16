@@ -169,6 +169,121 @@ python3 parameter_and_input_saliency.py \
     --image_target_label 0
 ```
 
+### Object Detection Extension Roadmap (YOLOX Tiny)
+
+This section describes the roadmap for supporting an object detection custom model
+using `externals/YOLOX/weights/yolox_tiny.pth`.
+
+#### 1) Gap analysis against the current implementation
+
+Current code is classification-centric. The main gaps are:
+
+1. Task pipeline is fixed to classification.
+    - `parameter_and_input_saliency.py` always instantiates `ClassificationTaskAdapter`.
+2. Target handling assumes class labels from logits `(B, C)`.
+    - `target/spec.py` and `target/resolver.py` are designed for classification labels.
+3. Input saliency post-processing assumes 224x224 shape.
+    - `save_gradients()` reshapes gradients to `(224, 224)`, which is incompatible with
+      YOLOX Tiny default input size `(416, 416)`.
+4. Statistics/inference cache flow assumes ImageNet-style classification runs.
+    - Detection-only runs can miss required cache entries unless explicit fallback behavior is added.
+5. Existing helper script for custom models is still configured for ResNet50 classification.
+    - `scripts/run_yolox_tiny_custom_model.sh` must be updated for YOLOX Tiny detection.
+
+#### 2) Extension architecture (design policy)
+
+Use the existing Model/Task/Target separation and extend only the task-specific path.
+
+1. Model layer:
+    - Keep `model_source=custom_module`.
+    - Add a small YOLOX wrapper class that builds Tiny from YOLOX Exp and loads
+      `yolox_tiny.pth` (`model` key or raw `state_dict`).
+    - Keep saliency unit extraction default (Conv2d output filters) for the first milestone.
+
+2. Task layer:
+    - Add `DetectionTaskAdapter(TaskAdapter)`.
+    - `build_objective()` converts detection outputs to a differentiable scalar objective
+      (for example top objectness-class score, or class-constrained score when class id is specified).
+    - `summarize_prediction()` reports top detections (class, score, box) for logging.
+
+3. Target layer:
+    - Phase 1: reuse existing `target_class_id` semantics where possible.
+    - Phase 2 (optional): add detection-specific target type(s), e.g. `top_detection`,
+      `specified_detection_class`, or ROI-conditioned targets.
+
+4. Runtime and compatibility:
+    - Add task selector CLI argument, e.g. `--task {classification,detection}`.
+    - Keep default as classification to preserve backward compatibility.
+    - Add robust fallback for saliency stats mode when dataset-level stats are unavailable.
+
+#### 3) Implementation proposal
+
+Proposed concrete changes:
+
+1. Add `task_adapter/detection.py`.
+    - Implement objective construction from YOLOX inference output.
+2. Update `task_adapter/__init__.py`.
+    - Export `DetectionTaskAdapter`.
+3. Update `parameter_and_input_saliency.py`.
+    - Add `--task` argument.
+    - Instantiate adapter by task type.
+    - Make `save_gradients()` shape-dynamic (no fixed 224x224).
+    - Add safe fallback from std mode to naive mode when statistics are missing.
+4. Add YOLOX custom-model wrapper module in this repository.
+    - Build model via YOLOX Exp (Tiny config).
+    - Load checkpoint from `externals/YOLOX/weights/yolox_tiny.pth`.
+5. Update `scripts/run_yolox_tiny_custom_model.sh`.
+    - Point weights path to YOLOX Tiny checkpoint.
+    - Use `--task detection` and wrapper class path.
+    - Ensure YOLOX import path is available via `PYTHONPATH` in Docker execution.
+
+#### 4) Step-by-step implementation plan
+
+Recommended sequence:
+
+1. Implement `DetectionTaskAdapter` and task selection CLI.
+2. Add YOLOX Tiny wrapper class and validate checkpoint loading only.
+3. Wire end-to-end saliency run for one raw image (no ImageNet val dependency).
+4. Remove fixed-size assumptions in gradient visualization.
+5. Add cache/statistics fallback behavior for detection-only usage.
+6. Update and validate `scripts/run_yolox_tiny_custom_model.sh` in Docker.
+7. Run regression check to confirm ResNet/classification scripts still work.
+
+#### 5) Progress tracking
+
+Use the table below to record implementation status.
+
+Status legend:
+
+- `TODO`: not started
+- `DOING`: in progress
+- `DONE`: implemented and verified
+- `BLOCKED`: waiting for dependency/fix
+
+| ID | Task | Status | Owner | Last update | Notes |
+|----|------|--------|-------|-------------|-------|
+| 1 | Implement `DetectionTaskAdapter` and task selection CLI | TODO | - | - | |
+| 2 | Add YOLOX Tiny wrapper class and validate checkpoint loading | TODO | - | - | |
+| 3 | Wire end-to-end saliency run for one raw image | TODO | - | - | |
+| 4 | Remove fixed-size assumptions in gradient visualization | TODO | - | - | |
+| 5 | Add cache/statistics fallback behavior for detection-only usage | TODO | - | - | |
+| 6 | Update and validate `scripts/run_yolox_tiny_custom_model.sh` in Docker | TODO | - | - | |
+| 7 | Run regression check for classification workflow | TODO | - | - | |
+
+Optional change log template:
+
+```text
+[YYYY-MM-DD] [ID] [STATUS] summary
+example: [2026-03-16] [2] [DOING] implemented YOLOX Tiny wrapper, loading test in progress
+```
+
+Validation criteria:
+
+1. The script runs with `externals/YOLOX/weights/yolox_tiny.pth` as custom model input.
+2. Detection objective backpropagates and returns parameter saliency without runtime errors.
+3. Input-space saliency figure is saved correctly for non-224 resolutions.
+4. Existing classification workflow remains unchanged by default.
+
 Project Organization
 ------------
     ├── README.md
