@@ -78,6 +78,10 @@ target/
 
 # exclude data from source control by default
 
+# Generated artifacts and backup outputs
+figures_bak*/
+results*/
+
 # Mac OS-specific storage files
 .DS_Store
 
