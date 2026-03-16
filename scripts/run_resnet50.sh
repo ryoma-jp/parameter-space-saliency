@@ -8,4 +8,5 @@ docker compose run --rm pss \
         --model resnet50 \
         --image_path raw_images/great_white_shark_mispred_as_killer_whale.jpeg \
         --output_root $OUTPUT_ROOT \
-        --image_target_label 2
+        --image_target_label 2 \
+        --export_model_pth $OUTPUT_ROOT/resnet50_exported.pth
