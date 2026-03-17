@@ -8,6 +8,7 @@ import argparse
 import os
 import seaborn as sns
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 import numpy as np
 import cv2
 import warnings
@@ -97,6 +98,14 @@ parser.add_argument('--image_target_label', default=None, type=int,
                     help='ground-truth class index (0-based) for the raw image')
 parser.add_argument('--reference_id', default=None, type=int,
                     help='index of image in the validation set')
+parser.add_argument('--det_annotations_json', default=None, type=str,
+                    help='COCO annotations JSON path for TP/FP/FN overlay in detection task')
+parser.add_argument('--det_conf_threshold', default=0.3, type=float,
+                    help='confidence threshold for detection overlay')
+parser.add_argument('--det_nms_iou_threshold', default=0.45, type=float,
+                    help='NMS IoU threshold for detection overlay')
+parser.add_argument('--det_match_iou_threshold', default=0.5, type=float,
+                    help='IoU threshold for TP/FP matching against GT')
 
 def _cache_key(args) -> str:
     """Derive a filesystem-safe cache key from model arguments."""
@@ -138,6 +147,207 @@ def _build_model_spec(args) -> dict:
     return spec
 
 
+def _resolve_detection_annotations_path(args) -> str:
+    if args.det_annotations_json:
+        return args.det_annotations_json
+
+    candidates = [
+        os.path.join('raw_images', 'coco2017', 'annotations', 'instances_val2017.json'),
+        os.path.join('externals', 'YOLOX', 'datasets', 'COCO', 'annotations', 'instances_val2017.json'),
+    ]
+    for cand in candidates:
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
+def _cxcywh_to_xyxy(boxes: np.ndarray) -> np.ndarray:
+    out = boxes.copy()
+    out[:, 0] = boxes[:, 0] - boxes[:, 2] / 2.0
+    out[:, 1] = boxes[:, 1] - boxes[:, 3] / 2.0
+    out[:, 2] = boxes[:, 0] + boxes[:, 2] / 2.0
+    out[:, 3] = boxes[:, 1] + boxes[:, 3] / 2.0
+    return out
+
+
+def _box_iou_xyxy(a: np.ndarray, b: np.ndarray) -> float:
+    x1 = max(a[0], b[0])
+    y1 = max(a[1], b[1])
+    x2 = min(a[2], b[2])
+    y2 = min(a[3], b[3])
+    inter_w = max(0.0, x2 - x1)
+    inter_h = max(0.0, y2 - y1)
+    inter = inter_w * inter_h
+    area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+    area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+    union = area_a + area_b - inter
+    if union <= 0:
+        return 0.0
+    return float(inter / union)
+
+
+def _nms_by_class(boxes_xyxy: np.ndarray, classes: np.ndarray, scores: np.ndarray, iou_thr: float) -> np.ndarray:
+    if boxes_xyxy.shape[0] == 0:
+        return np.array([], dtype=np.int64)
+
+    keep = []
+    for cls_id in np.unique(classes):
+        cls_inds = np.where(classes == cls_id)[0]
+        if cls_inds.size == 0:
+            continue
+        cls_boxes = torch.from_numpy(boxes_xyxy[cls_inds]).float()
+        cls_scores = torch.from_numpy(scores[cls_inds]).float()
+        kept_local = torchvision.ops.nms(cls_boxes, cls_scores, iou_thr).cpu().numpy()
+        keep.extend(cls_inds[kept_local].tolist())
+
+    keep = np.array(keep, dtype=np.int64)
+    keep = keep[np.argsort(scores[keep])[::-1]]
+    return keep
+
+
+def _load_coco_gt_for_image(args, image_hw):
+    ann_path = _resolve_detection_annotations_path(args)
+    if ann_path is None:
+        print('Detection overlay: COCO annotations JSON not found; FN overlay is skipped.')
+        return [], [], {}
+
+    if args.image_path is None:
+        return [], [], {}
+
+    with open(ann_path, 'r') as f:
+        coco = json.load(f)
+
+    basename = os.path.basename(args.image_path)
+    image_info = None
+    for img in coco.get('images', []):
+        if img.get('file_name') == basename:
+            image_info = img
+            break
+
+    if image_info is None:
+        print(f'Detection overlay: no GT entry found for image {basename}; FN overlay is skipped.')
+        return [], [], {}
+
+    sorted_categories = sorted(coco.get('categories', []), key=lambda cat: cat['id'])
+    cat_id_to_cls = {cat['id']: idx for idx, cat in enumerate(sorted_categories)}
+    cls_to_name = {idx: cat.get('name', str(cat['id'])) for idx, cat in enumerate(sorted_categories)}
+
+    raw_w = float(image_info['width'])
+    raw_h = float(image_info['height'])
+    h, w = image_hw
+    sx = float(w) / raw_w
+    sy = float(h) / raw_h
+
+    gt_boxes = []
+    gt_classes = []
+    image_id = image_info['id']
+    for ann in coco.get('annotations', []):
+        if ann.get('image_id') != image_id:
+            continue
+        if ann.get('iscrowd', 0) == 1:
+            continue
+        cat_id = ann.get('category_id')
+        if cat_id not in cat_id_to_cls:
+            continue
+        x, y, bw, bh = ann['bbox']
+        x1 = x * sx
+        y1 = y * sy
+        x2 = (x + bw) * sx
+        y2 = (y + bh) * sy
+        gt_boxes.append([x1, y1, x2, y2])
+        gt_classes.append(cat_id_to_cls[cat_id])
+
+    return gt_boxes, gt_classes, cls_to_name
+
+
+def _build_detection_overlay(reference_image, net, args):
+    if args.task != 'detection' or args.reference_id is not None:
+        return None
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    with torch.no_grad():
+        outputs = net(reference_image.to(device))
+
+    if outputs.ndim != 3 or outputs.size(0) == 0 or outputs.size(-1) < 6:
+        print('Detection overlay: unexpected model output shape; overlay is skipped.')
+        return None
+
+    pred = outputs[0].detach().cpu().numpy()
+    boxes_xyxy = _cxcywh_to_xyxy(pred[:, :4])
+    obj = pred[:, 4]
+    cls_scores = pred[:, 5:]
+    cls_ids = np.argmax(cls_scores, axis=1)
+    cls_conf = cls_scores[np.arange(cls_scores.shape[0]), cls_ids]
+    scores = obj * cls_conf
+
+    conf_mask = scores >= float(args.det_conf_threshold)
+    boxes_xyxy = boxes_xyxy[conf_mask]
+    cls_ids = cls_ids[conf_mask]
+    scores = scores[conf_mask]
+
+    if boxes_xyxy.shape[0] == 0:
+        return {'tp': [], 'fp': [], 'fn': [], 'class_names': {}}
+
+    keep = _nms_by_class(boxes_xyxy, cls_ids, scores, float(args.det_nms_iou_threshold))
+    boxes_xyxy = boxes_xyxy[keep]
+    cls_ids = cls_ids[keep]
+    scores = scores[keep]
+
+    h = int(reference_image.shape[-2])
+    w = int(reference_image.shape[-1])
+    boxes_xyxy[:, [0, 2]] = np.clip(boxes_xyxy[:, [0, 2]], 0, w - 1)
+    boxes_xyxy[:, [1, 3]] = np.clip(boxes_xyxy[:, [1, 3]], 0, h - 1)
+
+    gt_boxes, gt_classes, class_names = _load_coco_gt_for_image(args, image_hw=(h, w))
+    if len(gt_boxes) == 0:
+        # GT が無い場合は全予測をFPとして描画して注意喚起する。
+        return {
+            'tp': [],
+            'fp': [
+                {'box': boxes_xyxy[i].tolist(), 'cls_id': int(cls_ids[i])}
+                for i in range(boxes_xyxy.shape[0])
+            ],
+            'fn': [],
+            'class_names': class_names,
+        }
+
+    gt_boxes = np.array(gt_boxes, dtype=np.float32)
+    gt_classes = np.array(gt_classes, dtype=np.int64)
+
+    pred_order = np.argsort(scores)[::-1]
+    matched_gt = np.zeros(len(gt_boxes), dtype=bool)
+    tp_boxes = []
+    fp_boxes = []
+
+    iou_thr = float(args.det_match_iou_threshold)
+    for pidx in pred_order:
+        pbox = boxes_xyxy[pidx]
+        pcls = cls_ids[pidx]
+
+        candidate = np.where((gt_classes == pcls) & (~matched_gt))[0]
+        if candidate.size == 0:
+            fp_boxes.append({'box': pbox.tolist(), 'cls_id': int(pcls)})
+            continue
+
+        ious = np.array([_box_iou_xyxy(pbox, gt_boxes[g]) for g in candidate], dtype=np.float32)
+        best_local = int(np.argmax(ious))
+        best_iou = float(ious[best_local])
+        best_gt = int(candidate[best_local])
+
+        if best_iou >= iou_thr:
+            matched_gt[best_gt] = True
+            tp_boxes.append({'box': pbox.tolist(), 'cls_id': int(pcls)})
+        else:
+            fp_boxes.append({'box': pbox.tolist(), 'cls_id': int(pcls)})
+
+    fn_indices = np.where(~matched_gt)[0]
+    fn_boxes = [
+        {'box': gt_boxes[g].tolist(), 'cls_id': int(gt_classes[g])}
+        for g in fn_indices
+    ]
+    return {'tp': tp_boxes, 'fp': fp_boxes, 'fn': fn_boxes, 'class_names': class_names}
+
+
 def _export_model_checkpoint(model, args) -> None:
     """Export the loaded model as a checkpoint compatible with CustomModuleAdapter."""
     if not args.export_model_pth:
@@ -159,7 +369,7 @@ def _export_model_checkpoint(model, args) -> None:
     print(f'Exported loaded model checkpoint to {args.export_model_pth}')
 
 
-def save_gradients(grads_to_save, args, reference_image, inv_transform_test):
+def save_gradients(grads_to_save, args, reference_image, inv_transform_test, detection_overlay=None):
     grads_to_save, _ = grads_to_save.max(dim=1)
     grads_to_save = grads_to_save[0].detach().cpu().numpy()
     grads_to_save = np.abs(grads_to_save)
@@ -168,9 +378,6 @@ def save_gradients(grads_to_save, args, reference_image, inv_transform_test):
     #Percentile thresholding
     grads_to_save[grads_to_save > np.percentile(grads_to_save, 99)] = np.percentile(grads_to_save, 99)
     grads_to_save[grads_to_save < np.percentile(grads_to_save, 90)] = np.percentile(grads_to_save, 90)
-
-    plt.figure()
-    plt.imshow(grads_to_save)
 
     save_path = os.path.join(args.output_root, args.figure_folder_name)
     os.makedirs(save_path, exist_ok=True)
@@ -189,10 +396,41 @@ def save_gradients(grads_to_save, args, reference_image, inv_transform_test):
     heatmap_superimposed = show_heatmap_on_image(
         reference_image_to_compare.detach().cpu().numpy(), gradients_heatmap
     )
-    plt.imshow(heatmap_superimposed)
-    plt.axis('off')
+    fig, ax = plt.subplots()
+    ax.imshow(heatmap_superimposed)
+
+    if detection_overlay is not None:
+        color_map = {'tp': 'lime', 'fp': 'red', 'fn': 'yellow'}
+        class_names = detection_overlay.get('class_names', {})
+        for key in ('tp', 'fp', 'fn'):
+            for item in detection_overlay.get(key, []):
+                x1, y1, x2, y2 = item['box']
+                cls_id = int(item.get('cls_id', -1))
+                cls_name = class_names.get(cls_id, str(cls_id)) if cls_id >= 0 else 'unknown'
+                rect = Rectangle(
+                    (x1, y1),
+                    max(1.0, x2 - x1),
+                    max(1.0, y2 - y1),
+                    fill=False,
+                    edgecolor=color_map[key],
+                    linewidth=2.0,
+                )
+                ax.add_patch(rect)
+                ax.text(
+                    x1,
+                    max(0.0, y1 - 2.0),
+                    cls_name,
+                    color=color_map[key],
+                    fontsize=8,
+                    fontweight='bold',
+                    ha='left',
+                    va='bottom',
+                )
+
+    ax.axis('off')
     out_path = os.path.join(save_path, f'input_saliency_heatmap_{save_name}.png')
-    plt.savefig(out_path, bbox_inches='tight')
+    fig.savefig(out_path, bbox_inches='tight')
+    plt.close(fig)
     print(f'Input space saliency saved to {out_path}\n')
     return
 
@@ -446,7 +684,14 @@ if __name__ == '__main__':
     # ------------------------------------------------------------------ #
     # Save results                                                         #
     # ------------------------------------------------------------------ #
-    save_gradients(grads_to_save, args, reference_image, inv_transform_test)
+    detection_overlay = _build_detection_overlay(reference_image, net, args)
+    save_gradients(
+        grads_to_save,
+        args,
+        reference_image,
+        inv_transform_test,
+        detection_overlay=detection_overlay,
+    )
 
     fig, ax = plt.subplots(1, 1, figsize=(15, 4))
     ax.spines['right'].set_visible(False)

@@ -25,6 +25,6 @@ docker compose run --rm -u $(id -u):$(id -g) \
         --model_class_path yolox.models.build.yolox_custom \
         --model_kwargs_json '$MODEL_KWARGS_JSON' \
         --preprocess_cfg_json '$PREPROCESS_CFG_JSON' \
-        --image_path raw_images/great_white_shark_mispred_as_killer_whale.jpeg \
+        --image_path raw_images/coco2017/val2017/000000000139.jpg \
         --output_root "$OUTPUT_ROOT" \
             --target_type predicted_top1"
