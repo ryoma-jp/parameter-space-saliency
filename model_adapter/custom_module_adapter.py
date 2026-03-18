@@ -2,11 +2,65 @@ import importlib
 import sys
 from typing import Optional, Tuple
 
+import cv2
+import numpy as np
 import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
 
 from .base import ModelAdapter
+
+
+class _LetterboxTransform:
+    """PIL Image -> CHW float32 tensor via letterbox resize, matching YOLOX ``preproc()``.
+
+    The output tensor is in the [0, 255] range with the channel order specified
+    by *channel_order* (``'bgr'`` by default, matching YOLOX inference).
+    """
+
+    def __init__(self, input_size, pad_value: int = 114, channel_order: str = 'bgr'):
+        # input_size: (H, W) or [H, W]
+        self.input_size   = (int(input_size[0]), int(input_size[1]))
+        self.pad_value    = pad_value
+        self.channel_order = channel_order.lower()
+
+    def __call__(self, pil_img):
+        # PIL gives RGB HWC uint8
+        img = np.array(pil_img, dtype=np.uint8)
+        if self.channel_order == 'bgr':
+            img = img[:, :, ::-1]  # RGB -> BGR
+
+        src_h, src_w = img.shape[:2]
+        tgt_h, tgt_w = self.input_size
+        r = min(tgt_h / src_h, tgt_w / src_w)
+        new_h, new_w = int(src_h * r), int(src_w * r)
+
+        resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+        padded = np.ones((tgt_h, tgt_w, 3), dtype=np.uint8) * self.pad_value
+        padded[:new_h, :new_w] = resized
+
+        # HWC -> CHW float32 [0, 255]
+        tensor = torch.from_numpy(
+            np.ascontiguousarray(padded.transpose(2, 0, 1), dtype=np.float32)
+        )
+        return tensor
+
+
+class _LetterboxInvTransform:
+    """Inverse of ``_LetterboxTransform`` for visualization.
+
+    Converts CHW float32 [0, 255] (BGR or RGB) back to CHW float32 [0, 1] RGB.
+    """
+
+    def __init__(self, channel_order: str = 'bgr'):
+        self.channel_order = channel_order.lower()
+
+    def __call__(self, tensor):
+        tensor = tensor / 255.0
+        if self.channel_order == 'bgr':
+            tensor = tensor[[2, 1, 0]]  # BGR -> RGB
+        return tensor.clamp(0.0, 1.0)
 
 
 class CustomModuleAdapter(ModelAdapter):
@@ -110,6 +164,12 @@ class CustomModuleAdapter(ModelAdapter):
         return model
 
     def get_preprocess(self) -> transforms.Compose:
+        if self.preprocess_cfg.get('letterbox', False):
+            resize        = self.preprocess_cfg.get('resize', [416, 416])
+            pad_value     = int(self.preprocess_cfg.get('pad_value', 114))
+            channel_order = str(self.preprocess_cfg.get('channel_order', 'bgr'))
+            return _LetterboxTransform(resize, pad_value, channel_order)
+
         resize    = self.preprocess_cfg.get('resize', 256)
         crop      = self.preprocess_cfg.get('crop',   224)
         normalize = self.preprocess_cfg.get('normalize', True)
@@ -127,6 +187,10 @@ class CustomModuleAdapter(ModelAdapter):
         return transforms.Compose(transform_ops)
 
     def get_inv_preprocess(self) -> transforms.Compose:
+        if self.preprocess_cfg.get('letterbox', False):
+            channel_order = str(self.preprocess_cfg.get('channel_order', 'bgr'))
+            return _LetterboxInvTransform(channel_order)
+
         mean, std = self._mean_std()
         normalize = self.preprocess_cfg.get('normalize', True)
         scale     = float(self.preprocess_cfg.get('scale', 1.0))

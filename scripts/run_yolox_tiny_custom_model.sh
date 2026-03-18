@@ -3,7 +3,7 @@
 MODEL_WEIGHTS_PATH=externals/YOLOX/weights/yolox_tiny.pth
 OUTPUT_ROOT=results/yolox_tiny_custom_model
 MODEL_KWARGS_JSON='{"exp_path":"/work/externals/YOLOX/exps/default/yolox_tiny.py","ckpt_path":"externals/YOLOX/weights/yolox_tiny.pth","device":"cpu"}'
-PREPROCESS_CFG_JSON='{"resize":[416,416],"crop":null,"normalize":false,"scale":255.0}'
+PREPROCESS_CFG_JSON='{"resize":[416,416],"letterbox":true,"pad_value":114,"channel_order":"bgr"}'
 
 if [ ! -f "$MODEL_WEIGHTS_PATH" ]; then
     echo "Missing checkpoint: $MODEL_WEIGHTS_PATH"
