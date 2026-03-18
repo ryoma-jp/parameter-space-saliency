@@ -5,6 +5,16 @@ import torch.nn as nn
 import torchvision.transforms as transforms
 
 
+_YOLOX_DEFAULT_LAYER_MAPPING = {
+    "backbone_s8": "backbone.backbone.dark3",
+    "backbone_s16": "backbone.backbone.dark4",
+    "backbone_s32": "backbone.backbone.dark5",
+    "neck_s8": "backbone.C3_p3",
+    "neck_s16": "backbone.C3_n3",
+    "neck_s32": "backbone.C3_n4",
+}
+
+
 class ModelAdapter(ABC):
     """Abstract base class for model adapters.
 
@@ -69,3 +79,37 @@ class ModelAdapter(ABC):
                     layer_to_filter_id.setdefault(name, []).append(ind + j)
                 ind += param.size()[0]
         return layer_to_filter_id
+
+    def get_feature_export_layers(self, model: nn.Module) -> Dict[str, str]:
+        """Return {logical_name: module_name} mapping for feature export.
+
+        The default policy exports activations for the same weight-owning modules
+        that participate in filter-wise saliency, which keeps saved features aligned
+        with the existing saliency unit definition.
+        """
+        layer_mapping: Dict[str, str] = {}
+        module_dict = dict(model.named_modules())
+
+        for name, param in model.named_parameters():
+            if len(param.size()) != 4 or not name.endswith('.weight'):
+                continue
+
+            module_name = name.rsplit('.', 1)[0]
+            if module_name not in module_dict:
+                continue
+
+            logical_name = module_name.replace('.', '_')
+            suffix = 2
+            while logical_name in layer_mapping:
+                logical_name = f"{module_name.replace('.', '_')}_{suffix}"
+                suffix += 1
+
+            layer_mapping[logical_name] = module_name
+
+        # If this is a YOLOX-like model, also export the same six logical
+        # feature levels used by externals/YOLOX/tools/visualize_eval_results.py.
+        if all(module_name in module_dict for module_name in _YOLOX_DEFAULT_LAYER_MAPPING.values()):
+            for logical_name, module_name in _YOLOX_DEFAULT_LAYER_MAPPING.items():
+                layer_mapping.setdefault(logical_name, module_name)
+
+        return layer_mapping

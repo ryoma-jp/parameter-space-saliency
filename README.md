@@ -33,6 +33,18 @@ here --reference_id specifies the image id from ImageNet validation set
 
 The resulting plots (input space colormap and filter saliency plot) will be saved to /figures
 
+The script also exports intermediate feature tensors in the output directory using the same layout as the YOLOX tooling:
+
+```text
+<output_root>/
+    <image_key>/
+        feature_manifest.json
+        npy/
+            feat_<logical_name>.npy
+```
+
+`feature_manifest.json` stores the logical layer name, actual module name, tensor shape, dtype, and relative `.npy` path for each exported feature tensor.
+
 To export the loaded model weights to a `.pth` checkpoint while running the script, pass `--export_model_pth`:
 
 ```bash

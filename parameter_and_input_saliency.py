@@ -348,6 +348,123 @@ def _build_detection_overlay(reference_image, net, args):
     return {'tp': tp_boxes, 'fp': fp_boxes, 'fn': fn_boxes, 'class_names': class_names}
 
 
+def _reference_output_key(args) -> str:
+    return str(args.reference_id) if args.reference_id is not None else os.path.splitext(os.path.basename(args.image_path))[0]
+
+
+def _reference_file_name(args, testset) -> str:
+    if args.reference_id is None:
+        return os.path.basename(args.image_path)
+
+    if testset is not None:
+        samples = getattr(testset, 'samples', None)
+        if samples is not None and 0 <= int(args.reference_id) < len(samples):
+            sample_path = samples[int(args.reference_id)][0]
+            return os.path.basename(sample_path)
+
+    return _reference_output_key(args)
+
+
+def _register_feature_hooks(model, layer_mapping):
+    feature_cache = {}
+    handles = []
+    module_dict = dict(model.named_modules())
+
+    missing = [module_name for module_name in layer_mapping.values() if module_name not in module_dict]
+    if missing:
+        raise KeyError(
+            'Failed to find feature layers in model.named_modules(): {}'.format(', '.join(missing))
+        )
+
+    for logical_name, module_name in layer_mapping.items():
+        module = module_dict[module_name]
+
+        def _hook(_, __, output, logical_name_=logical_name, module_name_=module_name):
+            tensor = output[0] if isinstance(output, (list, tuple)) else output
+            if tensor is None or not hasattr(tensor, 'detach'):
+                return
+            feature_cache[logical_name_] = {
+                'module_name': module_name_,
+                'tensor': tensor.detach().cpu(),
+            }
+
+        handles.append(module.register_forward_hook(_hook))
+
+    return handles, feature_cache
+
+
+def _save_feature_arrays(
+    per_image_dir,
+    image_id_key,
+    file_name,
+    feature_cache,
+    model_input_shape,
+):
+    npy_dir = os.path.join(per_image_dir, 'npy')
+    os.makedirs(npy_dir, exist_ok=True)
+
+    manifest = {
+        'image_id': image_id_key,
+        'file_name': file_name,
+        'model_input_shape': list(model_input_shape),
+        'layers': [],
+    }
+
+    for logical_name in sorted(feature_cache.keys()):
+        item = feature_cache[logical_name]
+        tensor = item['tensor']
+        if tensor.ndim == 4 and tensor.shape[0] == 1:
+            tensor = tensor[0]
+
+        array = tensor.float().numpy()
+        file_base = 'feat_{}.npy'.format(logical_name)
+        file_path = os.path.join(npy_dir, file_base)
+        np.save(file_path, array)
+
+        manifest['layers'].append(
+            {
+                'logical_name': logical_name,
+                'module_name': item['module_name'],
+                'tensor_path': os.path.join('npy', file_base),
+                'shape': list(array.shape),
+                'dtype': str(array.dtype),
+            }
+        )
+
+    manifest_path = os.path.join(per_image_dir, 'feature_manifest.json')
+    with open(manifest_path, 'w', encoding='utf-8') as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+
+def _export_intermediate_features(reference_image, net, adapter, args, testset):
+    export_model = net.module if isinstance(net, torch.nn.DataParallel) else net
+    layer_mapping = adapter.get_feature_export_layers(export_model)
+    if not layer_mapping:
+        print('Intermediate feature export skipped: no eligible layers were found.')
+        return
+
+    image_id_key = _reference_output_key(args)
+    per_image_dir = os.path.join(args.output_root, image_id_key)
+    file_name = _reference_file_name(args, testset)
+
+    hook_handles, feature_cache = _register_feature_hooks(export_model, layer_mapping)
+    try:
+        with torch.no_grad():
+            export_model(reference_image.to(next(export_model.parameters()).device))
+    finally:
+        for handle in hook_handles:
+            handle.remove()
+
+    _save_feature_arrays(
+        per_image_dir=per_image_dir,
+        image_id_key=image_id_key,
+        file_name=file_name,
+        feature_cache=feature_cache,
+        model_input_shape=tuple(reference_image.shape),
+    )
+    print(f'Intermediate features saved to {per_image_dir}')
+
+
 def _export_model_checkpoint(model, args) -> None:
     """Export the loaded model as a checkpoint compatible with CustomModuleAdapter."""
     if not args.export_model_pth:
@@ -685,6 +802,7 @@ if __name__ == '__main__':
     # Save results                                                         #
     # ------------------------------------------------------------------ #
     detection_overlay = _build_detection_overlay(reference_image, net, args)
+    _export_intermediate_features(reference_image, net, adapter, args, testset)
     save_gradients(
         grads_to_save,
         args,
