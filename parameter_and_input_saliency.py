@@ -801,6 +801,10 @@ if __name__ == '__main__':
     # ------------------------------------------------------------------ #
     # Save results                                                         #
     # ------------------------------------------------------------------ #
+    input_tensor_path = os.path.join(args.output_root, 'input_tensor.npy')
+    np.save(input_tensor_path, reference_image.cpu().numpy())
+    print(f'Input tensor saved to {input_tensor_path}')
+
     detection_overlay = _build_detection_overlay(reference_image, net, args)
     _export_intermediate_features(reference_image, net, adapter, args, testset)
     save_gradients(
