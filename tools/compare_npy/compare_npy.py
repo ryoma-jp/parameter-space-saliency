@@ -94,6 +94,15 @@ def _compute_relative_error_floor(source_float: np.ndarray) -> float:
     return max(RELATIVE_ERROR_FLOOR_RATIO * source_ref_scale, ABSOLUTE_ERROR_FLOOR)
 
 
+def _build_percentile_stats(values: np.ndarray) -> dict[str, float]:
+    return {
+        "p90": float(np.percentile(values, 90)),
+        "p95": float(np.percentile(values, 95)),
+        "p99": float(np.percentile(values, 99)),
+        "p99_9": float(np.percentile(values, 99.9)),
+    }
+
+
 def compute_relative_error_stats(
     source: np.ndarray,
     target: np.ndarray,
@@ -106,7 +115,9 @@ def compute_relative_error_stats(
     floor = _compute_relative_error_floor(source_float)
 
     source_abs = np.abs(source_float)
-    denominator = np.maximum(source_abs, floor)
+    target_abs = np.abs(target_float)
+    # Symmetric denominator suppresses one-sided blow-ups near zero.
+    denominator = np.maximum(np.maximum(source_abs, target_abs), floor)
 
     equal_mask = source == target
     if np.issubdtype(source.dtype, np.inexact) or np.issubdtype(target.dtype, np.inexact):
@@ -141,6 +152,7 @@ def compute_relative_error_stats(
         "std": float(np.std(finite_relative_error)),
         "median": float(np.median(finite_relative_error)),
     }
+    stats.update(_build_percentile_stats(finite_relative_error))
     return stats, metadata
 
 
@@ -178,12 +190,16 @@ def build_result_text(
     if relative_error_stats is None or relative_error_meta is None:
         lines.append("Relative error stats: not available")
     else:
-        lines.append("Relative error stats (abs_error / max(abs(source), floor)):")
+        lines.append("Relative error stats (symmetric: abs_error / max(abs(source), abs(target), floor)):")
         lines.append(f"  max: {relative_error_stats['max']} ({relative_error_stats['max'] * 100:.6f}%)")
         lines.append(f"  min: {relative_error_stats['min']} ({relative_error_stats['min'] * 100:.6f}%)")
         lines.append(f"  mean: {relative_error_stats['mean']} ({relative_error_stats['mean'] * 100:.6f}%)")
         lines.append(f"  std: {relative_error_stats['std']} ({relative_error_stats['std'] * 100:.6f}%)")
         lines.append(f"  median: {relative_error_stats['median']} ({relative_error_stats['median'] * 100:.6f}%)")
+        lines.append(f"  p90: {relative_error_stats['p90']} ({relative_error_stats['p90'] * 100:.6f}%)")
+        lines.append(f"  p95: {relative_error_stats['p95']} ({relative_error_stats['p95'] * 100:.6f}%)")
+        lines.append(f"  p99: {relative_error_stats['p99']} ({relative_error_stats['p99'] * 100:.6f}%)")
+        lines.append(f"  p99.9: {relative_error_stats['p99_9']} ({relative_error_stats['p99_9'] * 100:.6f}%)")
         lines.append(
             "Relative error config: "
             "reference=median(|source| where |source|>0), "
