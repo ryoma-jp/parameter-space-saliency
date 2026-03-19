@@ -802,7 +802,7 @@ if __name__ == '__main__':
     # Save results                                                         #
     # ------------------------------------------------------------------ #
     input_tensor_path = os.path.join(args.output_root, 'input_tensor.npy')
-    np.save(input_tensor_path, reference_image.cpu().numpy())
+    np.save(input_tensor_path, reference_image.cpu().numpy()[0, :3])  # Save the original input tensor (without gradients) for reference
     print(f'Input tensor saved to {input_tensor_path}')
 
     detection_overlay = _build_detection_overlay(reference_image, net, args)

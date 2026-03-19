@@ -7,6 +7,8 @@ This is a small utility for comparing two `.npy` files and writing the result to
 - Load and compare two `.npy` files
 - Write `Comparison result: Match` to `result.txt` when the files match
 - Write `Comparison result: Mismatch` to `result.txt` and a sparse diff to `diff.csv` when they do not match
+- Write absolute-error statistics (`max`, `min`, `mean`, `std`, `median`) to `result.txt` when numeric arrays are comparable
+- Write relative-error-rate statistics (`max`, `min`, `mean`, `std`, `median`) to `result.txt` to make errors scale-aware
 - `diff.csv` contains only the mismatched elements, so the number of rows scales with the number of differences rather than the total number of elements
 - Allow the output directory to be specified via a command-line argument
 
@@ -17,6 +19,39 @@ The comparison checks the following:
 - Array values
 
 For floating-point arrays, `NaN` values are treated as equal to each other.
+
+## Error Rate Design Policy
+
+This tool reports not only absolute error but also a scale-aware error rate.
+
+### Why relative error is needed
+
+An absolute error of `0.01` can be negligible for values around `1000`, but large for values around `0.01`.
+To capture this, the tool computes element-wise relative error before aggregating statistics.
+
+### Relative error definition
+
+For each element, the tool computes:
+
+- `abs_error_i = |target_i - source_i|`
+- `relative_error_i = abs_error_i / max(|source_i|, floor)`
+
+The denominator uses source magnitude so the rate is interpreted as "error size relative to original data size".
+
+### Choosing the denominator floor
+
+To avoid instability near zero, the tool uses a floor value:
+
+- `reference_scale = median(|source| where |source| > 0)`
+- `floor = max(1e-6 * reference_scale, 1e-12)`
+
+Rationale for using the median of non-zero `|source|`:
+
+- More robust to outliers than `max` or `mean`
+- Avoids exploding rates caused by tiny minimum values
+- Better represents the "typical" magnitude of source data
+
+The output also reports how often the floor was applied, so users can judge how much of the array is near zero.
 
 ## Creating Sample `.npy` Files
 
@@ -74,6 +109,20 @@ target: results/b.npy
 source shape: (2, 2)  dtype: float32
 target shape: (2, 2)  dtype: float32
 Comparison result: Match
+Absolute error stats:
+	max: 0.0
+	min: 0.0
+	mean: 0.0
+	std: 0.0
+	median: 0.0
+Relative error stats (abs_error / max(abs(source), floor)):
+	max: 0.0 (0.000000%)
+	min: 0.0 (0.000000%)
+	mean: 0.0 (0.000000%)
+	std: 0.0 (0.000000%)
+	median: 0.0 (0.000000%)
+Relative error config: reference=median(|source| where |source|>0), floor_ratio=1e-06, floor=2e-06, reference_scale=2.0
+Relative error floor usage: 0/4 (0.000000%)
 ```
 
 `result.txt` when the arrays do not match:
@@ -84,6 +133,20 @@ target: results/c.npy
 source shape: (2, 2)  dtype: float32
 target shape: (2, 2)  dtype: float32
 Comparison result: Mismatch
+Absolute error stats:
+	max: 0.5
+	min: 0.0
+	mean: 0.125
+	std: 0.21650635094610965
+	median: 0.0
+Relative error stats (abs_error / max(abs(source), floor)):
+	max: 0.25 (25.000000%)
+	min: 0.0 (0.000000%)
+	mean: 0.0625 (6.250000%)
+	std: 0.10825317547305482 (10.825318%)
+	median: 0.0 (0.000000%)
+Relative error config: reference=median(|source| where |source|>0), floor_ratio=1e-06, floor=2e-06, reference_scale=2.0
+Relative error floor usage: 0/4 (0.000000%)
 ```
 
 `diff.csv` (only rows where values differ):
