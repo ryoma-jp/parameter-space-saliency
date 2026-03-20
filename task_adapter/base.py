@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -27,6 +27,7 @@ class TaskAdapter(ABC):
         inputs: torch.Tensor,
         true_labels: torch.Tensor,
         target_spec: TargetSpec,
+        objective_context: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute the scalar loss and the resolved target labels.
 
@@ -35,6 +36,7 @@ class TaskAdapter(ABC):
             inputs:       Preprocessed input batch (B, C, H, W).
             true_labels:  Ground-truth labels for the batch (B,).
             target_spec:  Specification of which target to use.
+            objective_context: Optional task/model-specific context.
 
         Returns:
             (loss, resolved_targets) where loss is a scalar tensor and

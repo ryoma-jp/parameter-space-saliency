@@ -1,4 +1,5 @@
 import time
+from typing import Any, Dict, Optional
 
 import torch
 import torch.autograd as autograd
@@ -46,6 +47,7 @@ class SaliencyModel(nn.Module):
         target_spec: TargetSpec,
         testset_mean_abs_grad: torch.Tensor = None,
         testset_std_abs_grad:  torch.Tensor = None,
+        objective_context: Optional[Dict[str, Any]] = None,
     ) -> torch.Tensor:
         inputs.requires_grad_()
         self.net.eval()
@@ -53,7 +55,11 @@ class SaliencyModel(nn.Module):
         self.net.zero_grad()
 
         loss, _ = self.task_adapter.build_objective(
-            self.net, inputs, true_labels, target_spec
+            self.net,
+            inputs,
+            true_labels,
+            target_spec,
+            objective_context=objective_context,
         )
 
         gradients = autograd.grad(

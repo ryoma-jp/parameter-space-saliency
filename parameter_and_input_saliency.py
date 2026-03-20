@@ -106,12 +106,35 @@ parser.add_argument('--det_nms_iou_threshold', default=0.45, type=float,
                     help='NMS IoU threshold for detection overlay')
 parser.add_argument('--det_match_iou_threshold', default=0.5, type=float,
                     help='IoU threshold for TP/FP matching against GT')
+parser.add_argument('--det_objective_mode',
+                    default='gt_all_instances',
+                    choices=['gt_all_instances', 'gt_all_classes', 'legacy_single_class'],
+                    help='objective mode for detection saliency loss')
+parser.add_argument('--det_objective_provider',
+                    default='auto',
+                    choices=['auto', 'none', 'yolox_official'],
+                    help='optional model-specific objective provider')
+parser.add_argument('--det_provider_strict', action='store_true',
+                    help='error if requested detection objective provider is unavailable')
+parser.add_argument('--det_iou_weight', default=3.0, type=float,
+                    help='weight of IoU term in gt_all_instances objective')
+parser.add_argument('--det_score_weight', default=1.0, type=float,
+                    help='weight of class-score term in gt_all_instances objective')
 
 def _cache_key(args) -> str:
     """Derive a filesystem-safe cache key from model arguments."""
     if args.model_source == 'torchvision':
         return args.model
     return args.model_class_path.split('.')[-1]
+
+
+def _get_preprocess_cfg(args) -> dict:
+    if not hasattr(args, '_cached_preprocess_cfg'):
+        cfg = {}
+        if args.preprocess_cfg_json:
+            cfg = json.loads(args.preprocess_cfg_json)
+        args._cached_preprocess_cfg = cfg
+    return args._cached_preprocess_cfg
 
 
 def _load_label_map(args) -> dict:
@@ -235,8 +258,16 @@ def _load_coco_gt_for_image(args, image_hw):
     raw_w = float(image_info['width'])
     raw_h = float(image_info['height'])
     h, w = image_hw
-    sx = float(w) / raw_w
-    sy = float(h) / raw_h
+    preprocess_cfg = _get_preprocess_cfg(args)
+    use_letterbox = bool(preprocess_cfg.get('letterbox', False))
+
+    if use_letterbox:
+        r = min(float(w) / raw_w, float(h) / raw_h)
+        sx = r
+        sy = r
+    else:
+        sx = float(w) / raw_w
+        sy = float(h) / raw_h
 
     gt_boxes = []
     gt_classes = []
@@ -258,6 +289,57 @@ def _load_coco_gt_for_image(args, image_hw):
         gt_classes.append(cat_id_to_cls[cat_id])
 
     return gt_boxes, gt_classes, cls_to_name
+
+
+def _xyxy_to_cxcywh(boxes_xyxy: np.ndarray) -> np.ndarray:
+    out = np.zeros_like(boxes_xyxy)
+    out[:, 0] = (boxes_xyxy[:, 0] + boxes_xyxy[:, 2]) / 2.0
+    out[:, 1] = (boxes_xyxy[:, 1] + boxes_xyxy[:, 3]) / 2.0
+    out[:, 2] = np.clip(boxes_xyxy[:, 2] - boxes_xyxy[:, 0], a_min=0.0, a_max=None)
+    out[:, 3] = np.clip(boxes_xyxy[:, 3] - boxes_xyxy[:, 1], a_min=0.0, a_max=None)
+    return out
+
+
+def _build_detection_objective_context(args, reference_image):
+    if args.task != 'detection':
+        return None
+
+    context = {
+        'det_objective_mode': args.det_objective_mode,
+        'det_objective_provider': args.det_objective_provider,
+        'det_provider_strict': args.det_provider_strict,
+        'det_iou_weight': args.det_iou_weight,
+        'det_score_weight': args.det_score_weight,
+    }
+
+    if args.det_objective_mode == 'legacy_single_class':
+        return context
+
+    if args.reference_id is not None:
+        raise NotImplementedError(
+            'Detection objective modes based on GT instances currently require --image_path; '
+            '--reference_id is not supported yet.'
+        )
+
+    h = int(reference_image.shape[-2])
+    w = int(reference_image.shape[-1])
+    gt_boxes, gt_classes, _ = _load_coco_gt_for_image(args, image_hw=(h, w))
+    if len(gt_boxes) == 0:
+        raise ValueError(
+            'No COCO GT instances were found for the selected image. '
+            'Provide --det_annotations_json and ensure --image_path matches file_name in annotations.'
+        )
+
+    boxes_xyxy = np.array(gt_boxes, dtype=np.float32)
+    boxes_cxcywh = _xyxy_to_cxcywh(boxes_xyxy)
+    context['det_gt_instances'] = [
+        {
+            'class_ids': torch.tensor(gt_classes, dtype=torch.long),
+            'boxes_xyxy': torch.from_numpy(boxes_xyxy),
+            'boxes_cxcywh': torch.from_numpy(boxes_cxcywh),
+        }
+    ]
+    return context
 
 
 def _build_detection_overlay(reference_image, net, args):
@@ -556,6 +638,7 @@ def compute_input_space_saliency(
     task_adapter, target_spec,
     testset_mean_stat=None, testset_std_stat=None,
     inv_transform_test=None, readable_labels=None,
+    objective_context=None,
 ):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     saliency_mode = 'std'
@@ -592,6 +675,7 @@ def compute_input_space_saliency(
             perturbed_inputs, reference_targets, target_spec,
             testset_mean_abs_grad=testset_mean_stat,
             testset_std_abs_grad=testset_std_stat,
+            objective_context=objective_context,
         ).to(device)
 
         if args.compare_random:
@@ -677,7 +761,11 @@ if __name__ == '__main__':
     if args.task == 'classification':
         task_adapter = ClassificationTaskAdapter()
     else:
-        task_adapter = DetectionTaskAdapter()
+        task_adapter = DetectionTaskAdapter(
+            objective_mode=args.det_objective_mode,
+            objective_provider=args.det_objective_provider,
+            provider_strict=args.det_provider_strict,
+        )
     target_spec  = TargetSpec.from_args(args.target_type, args.target_class_id)
 
     # ------------------------------------------------------------------ #
@@ -744,7 +832,11 @@ if __name__ == '__main__':
         model_helpers_root_path,
         f'ImageNet_val_saliency_stat_{ck}{target_suffix}_filter_wise.pth',
     )
-    if os.path.isfile(filter_stats_file):
+    if args.task == 'detection' and args.det_objective_mode != 'legacy_single_class':
+        filter_testset_mean_abs_grad = None
+        filter_testset_std_abs_grad  = None
+        print('Skipping testset saliency statistics for detection objective mode requiring per-image GT context.')
+    elif os.path.isfile(filter_stats_file):
         filter_stats                 = torch.load(filter_stats_file)
         filter_testset_mean_abs_grad = filter_stats['mean']
         filter_testset_std_abs_grad  = filter_stats['std']
@@ -784,6 +876,8 @@ if __name__ == '__main__':
         reference_target = torch.tensor(reference_target).unsqueeze(0)
         reference_image.unsqueeze_(0)
 
+    objective_context = _build_detection_objective_context(args, reference_image)
+
     # ------------------------------------------------------------------ #
     # Compute saliency                                                     #
     # ------------------------------------------------------------------ #
@@ -792,6 +886,7 @@ if __name__ == '__main__':
         task_adapter, target_spec,
         filter_testset_mean_abs_grad, filter_testset_std_abs_grad,
         inv_transform_test, readable_labels,
+        objective_context=objective_context,
     )
 
     layer_sorted_profile, _ = sort_filters_layer_wise(

@@ -1,4 +1,4 @@
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -30,6 +30,7 @@ class ClassificationTaskAdapter(TaskAdapter):
         inputs: torch.Tensor,
         true_labels: torch.Tensor,
         target_spec: TargetSpec,
+        objective_context: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         outputs  = model(inputs)
         resolved = self._resolver.resolve(outputs, true_labels, target_spec)

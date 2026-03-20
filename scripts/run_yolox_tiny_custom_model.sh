@@ -26,5 +26,8 @@ docker compose run --rm -u $(id -u):$(id -g) \
         --model_kwargs_json '$MODEL_KWARGS_JSON' \
         --preprocess_cfg_json '$PREPROCESS_CFG_JSON' \
         --image_path raw_images/coco2017/val2017/000000397133.jpg \
+        --det_annotations_json raw_images/coco2017/annotations/instances_val2017.json \
         --output_root "$OUTPUT_ROOT" \
-            --target_type predicted_top1"
+        --det_objective_mode gt_all_instances \
+        --det_objective_provider yolox_official \
+        --target_type true_label"
