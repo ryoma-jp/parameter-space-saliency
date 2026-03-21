@@ -15,7 +15,8 @@ if [ ! -f "$MODEL_WEIGHTS_PATH" ]; then
     exit 1
 fi
 
-for method in auto matching; do
+#for method in auto matching; do
+for method in auto; do
     OUTPUT_ROOT="${OUTPUT_ROOT_BASE}_${method}"
     echo "Running input saliency with method=${method}, det_fp_loc_weight=${DET_FP_LOC_WEIGHT}"
     rm -rf "$OUTPUT_ROOT"

@@ -444,7 +444,7 @@ def _save_component_gradient_exports(
         return
 
     save_name = _reference_save_name(args)
-    root_dir = os.path.join(args.output_root, 'loss_component_saliency')
+    root_dir = os.path.join(_per_image_output_dir(args), 'loss_component_saliency')
     raw_dir = os.path.join(root_dir, 'raw_gradients')
     map_dir = os.path.join(root_dir, 'maps')
     image_dir = os.path.join(root_dir, 'images')
@@ -821,6 +821,10 @@ def _reference_output_key(args) -> str:
     return str(args.reference_id) if args.reference_id is not None else os.path.splitext(os.path.basename(args.image_path))[0]
 
 
+def _per_image_output_dir(args) -> str:
+    return os.path.join(args.output_root, _reference_output_key(args))
+
+
 def _reference_file_name(args, testset) -> str:
     if args.reference_id is None:
         return os.path.basename(args.image_path)
@@ -957,7 +961,7 @@ def _export_model_checkpoint(model, args) -> None:
 
 def save_gradients(grads_to_save, args, reference_image, inv_transform_test, detection_overlay=None):
     arrays = _prepare_gradient_arrays(grads_to_save)
-    save_path = os.path.join(args.output_root, args.figure_folder_name)
+    save_path = os.path.join(_per_image_output_dir(args), args.figure_folder_name)
     os.makedirs(save_path, exist_ok=True)
     save_name = _reference_save_name(args)
     plt.axis('off')
@@ -1313,13 +1317,15 @@ if __name__ == '__main__':
     # ------------------------------------------------------------------ #
     # Save results                                                         #
     # ------------------------------------------------------------------ #
-    input_tensor_path = os.path.join(args.output_root, 'input_tensor.npy')
+    per_image_dir = _per_image_output_dir(args)
+    os.makedirs(per_image_dir, exist_ok=True)
+
+    input_tensor_path = os.path.join(per_image_dir, 'input_tensor.npy')
     np.save(input_tensor_path, reference_image.cpu().numpy()[0, :3])  # Save the original input tensor (without gradients) for reference
     print(f'Input tensor saved to {input_tensor_path}')
 
     detection_overlay = _build_detection_overlay(reference_image, net, args)
     if detection_overlay is not None:
-        per_image_dir = os.path.join(args.output_root, _reference_output_key(args))
         _save_detection_box_overlays(
             reference_image,
             inv_transform_test,
@@ -1356,7 +1362,7 @@ if __name__ == '__main__':
     save_name = (str(args.reference_id) if args.reference_id is not None
                  else args.image_path.split('/')[-1].split('.')[0])
     save_name += '_' + ck
-    out_path = os.path.join(args.output_root, f'filter_saliency_{save_name}.png')
+    out_path = os.path.join(per_image_dir, f'filter_saliency_{save_name}.png')
     fig.savefig(out_path)
     print(f'Filter saliency saved to {out_path}')
 #Run this: python3 parameter_and_input_saliency.py --model resnet50 --image_path raw_images/great_white_shark_mispred_as_killer_whale.jpeg --image_target_label 2

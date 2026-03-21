@@ -15,23 +15,65 @@ $ docker-compose exec pss bash
 
 Basic Use
 ---------
-The script input_saliency.py computes both the parameter-saliency profile of an image which allows to find misbehaving filters in a neural network responsible for misclassification of a given image. In addition, the script computes the image-space saliency which highlights pixels which drive the high filter saliency values.
+The script `parameter_and_input_saliency.py` computes both:
+
+- Parameter-space saliency (which filters/components are responsible for the objective)
+- Input-space saliency (which pixels drive those parameter/component saliency values)
 
 To compute the parameter saliency profile for a given image, the script accepts 
-* either path to the raw image + image target label
+
+- either path to the raw image + image target label
+
 ```bash
 python3 parameter_and_input_saliency.py --model resnet50 --image_path raw_images/great_white_shark_mispred_as_killer_whale.jpeg --image_target_label 2
 ```
-* or reference_id -- the index of the given image in ImageNet validation set.
+
+- or `reference_id` (index of the image in ImageNet validation set)
+
 ```bash
 python3 parameter_and_input_saliency.py --reference_id 107 --k_salient 10
 ```
 
-here --reference_id specifies the image id from ImageNet validation set
+`--reference_id` specifies the image id from ImageNet validation set.
 
---k_salient specifies the number of top salient filters to use for the input-space visualization
+`--k_salient` specifies the number of top salient filters to use for input-space visualization in matching mode.
 
-The resulting plots (input space colormap and filter saliency plot) will be saved to /figures
+### Output directory layout
+
+All generated artifacts are grouped per image under:
+
+```text
+<output_root>/<image-id>/
+```
+
+Where:
+
+- `<output_root>` is `--output_root` (default: `figures`)
+- `<image-id>` is `--reference_id` value when `--reference_id` is used
+- `<image-id>` is otherwise the basename of `--image_path` without extension
+
+Main outputs:
+
+```text
+<output_root>/
+    <image-id>/
+        input_tensor.npy
+        filter_saliency_<image-id>_<model-key>.png
+        input_space_saliency/
+            input_saliency_heatmap_<image-id>_<model-key>.png
+        loss_component_saliency/
+            raw_gradients/
+            maps/
+            images/
+            <image-id>_<model-key>_metadata.json
+        feature_manifest.json
+        npy/
+            feat_<logical_name>.npy
+        detection_boxes_gt_only.png
+        detection_boxes_pred_only.png
+```
+
+`loss_component_saliency/` is populated for detection task runs that produce component gradients.
 
 The script also exports intermediate feature tensors in the output directory using the same layout as the YOLOX tooling:
 
@@ -57,9 +99,112 @@ python3 parameter_and_input_saliency.py \
 
 The exported file is model-agnostic and stores a `state_dict` under the `state_dict` key, plus minimal metadata about how the model was loaded.
 
+### `parameter_and_input_saliency.py` arguments
+
+Below is a practical argument reference grouped by purpose.
+
+#### Core run control
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--model` | `resnet50` | Torchvision model name (when `--model_source torchvision`). |
+| `--model_source` | `torchvision` | Model source: `torchvision` or `custom_module`. |
+| `--task` | `classification` | Task adapter: `classification` or `detection`. |
+| `--output_root` | `figures` | Root output directory. |
+| `--figure_folder_name` | `input_space_saliency` | Subdirectory name for input-space saliency images (inside `<output_root>/<image-id>/`). |
+
+#### Image / dataset input
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--image_path` | `raw_images/great_white_shark_mispred_as_killer_whale.jpeg` | Raw image path for single-image run. |
+| `--image_target_label` | `None` | Ground-truth label index for `--image_path` run. |
+| `--reference_id` | `None` | Image index from ImageNet validation set. |
+| `--data_to_use` | `ImageNet` | Dataset selector (currently ImageNet only). |
+| `--imagenet_val_path` | placeholder | Path to ImageNet validation directory. |
+| `--label_map_path` | `None` | YAML label map for class id to class name. |
+
+#### Target selection
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--target_type` | `true_label` | Objective target: `true_label`, `predicted_top1`, `specified_class`. |
+| `--target_class_id` | `None` | Class id used when `--target_type specified_class`. |
+
+#### Saliency behavior
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--signed` | off | Use signed saliency instead of absolute-gradient-based behavior. |
+| `--boost_factor` | `100.0` | Boost factor for top salient filters in matching mode. |
+| `--k_salient` | `10` | Number of top filters to boost in matching mode. |
+| `--compare_random` | off | Boost random filters instead of top salient filters. |
+| `--noise_iters` | `1` | Number of noisy forward/backward iterations to average. |
+| `--noise_percent` | `0` | Noise mixing ratio for SmoothGrad-like averaging. |
+| `--input_saliency_method` | `auto` | `matching`, `direct_loss`, or `auto` (`classification -> matching`, `detection -> direct_loss`). |
+
+#### Detection-specific options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--det_annotations_json` | `None` | COCO annotations path used for GT matching and overlays. |
+| `--det_conf_threshold` | `0.3` | Score threshold for predicted boxes in overlays/objective pipeline. |
+| `--det_nms_iou_threshold` | `0.45` | NMS IoU threshold. |
+| `--det_match_iou_threshold` | `0.5` | IoU threshold for TP/FP/FN matching against GT. |
+| `--det_objective_mode` | `gt_all_instances` | Detection objective mode. |
+| `--det_objective_provider` | `auto` | Optional model-specific objective provider. |
+| `--det_provider_strict` | off | Raise error if requested provider is unavailable. |
+| `--det_iou_weight` | `3.0` | IoU term weight in GT-instance objective. |
+| `--det_score_weight` | `1.0` | Class-score term weight in GT-instance objective. |
+| `--det_fp_loc_weight` | `0.0` | Weight of location-FP term (`0` disables). |
+| `--det_fp_loc_iou_threshold` | `0.3` | IoU threshold for low-IoU FP localization term. |
+| `--det_fp_loc_gate_sharpness` | `12.0` | Sigmoid sharpness for FP localization gating. |
+| `--det_fp_loc_score_power` | `1.0` | Score exponent in FP localization term. |
+
+#### Custom model loading options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--model_class_path` | `None` | Fully-qualified class/callable path for `custom_module`. |
+| `--model_weights_path` | `None` | Checkpoint path for custom model loading. |
+| `--model_import_root` | `[]` | Extra import roots (repeatable). |
+| `--model_kwargs_json` | `None` | JSON kwargs passed to model constructor/factory. |
+| `--preprocess_cfg_json` | `None` | JSON preprocessing override (`resize`, `crop`, `normalize`, `scale`, etc.). |
+| `--state_dict_target_path` | `None` | Dotted path for nested target to call `load_state_dict()`. |
+| `--export_model_pth` | `None` | Export loaded model checkpoint while running. |
+
+#### Deprecated (not implemented)
+
+| Option | Status | Description |
+|--------|--------|-------------|
+| `--logit` | deprecated | Not implemented. |
+| `--logit_difference` | deprecated | Not implemented. |
+
+### Detection overlay color legend
+
+In saliency heatmap overlays for detection runs, box colors are:
+
+- `TP`: lime
+- `FP` (aggregate): red
+- `FP (class mismatch)`: red
+- `FP (localization)`: orange
+- `FN`: yellow
+
+In exported box-only images:
+
+- `detection_boxes_gt_only.png`: yellow boxes (GT)
+- `detection_boxes_pred_only.png`: red boxes (predictions)
+
+### Notes and troubleshooting
+
+- `--reference_id` requires a valid `--imagenet_val_path` because the image is loaded from ImageNet validation data.
+- For detection objectives that require per-image GT context (`gt_all_instances`, `gt_all_classes`), single-image `--image_path` runs are expected; `--reference_id` is currently not supported for those modes.
+- If test-set saliency statistics are unavailable, the script automatically falls back from `std` mode to `naive` mode.
+- For custom models, providing `--label_map_path` improves prediction summaries and overlay readability.
+
 Demo
 -----
-The demo raw image is in /raw_images. The results are in /figures.
+The demo raw image is in `/raw_images`. The results are saved under `/figures/<image-id>/` by default.
 
 Using Custom Models
 -------------------
