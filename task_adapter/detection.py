@@ -211,6 +211,45 @@ class DetectionTaskAdapter(TaskAdapter):
         union = area_a + area_b - inter
         return inter / union.clamp_min(1e-8)
 
+    @classmethod
+    def _nms_indices_by_class(
+        cls,
+        boxes_xyxy: torch.Tensor,
+        class_ids: torch.Tensor,
+        scores: torch.Tensor,
+        iou_threshold: float,
+    ) -> torch.Tensor:
+        if boxes_xyxy.numel() == 0:
+            return torch.empty((0,), dtype=torch.long, device=boxes_xyxy.device)
+
+        keep = []
+        unique_classes = torch.unique(class_ids)
+        for class_id in unique_classes:
+            class_mask = class_ids == class_id
+            class_indices = torch.nonzero(class_mask, as_tuple=False).squeeze(1)
+            if class_indices.numel() == 0:
+                continue
+
+            class_scores = scores[class_indices]
+            order = class_indices[torch.argsort(class_scores, descending=True)]
+
+            while order.numel() > 0:
+                current = int(order[0].item())
+                keep.append(current)
+                if order.numel() == 1:
+                    break
+
+                rest = order[1:]
+                ious = cls._box_iou_xyxy_vec(boxes_xyxy[rest], boxes_xyxy[current])
+                order = rest[ious <= float(iou_threshold)]
+
+        if not keep:
+            return torch.empty((0,), dtype=torch.long, device=boxes_xyxy.device)
+
+        keep_tensor = torch.tensor(keep, dtype=torch.long, device=boxes_xyxy.device)
+        keep_scores = scores[keep_tensor]
+        return keep_tensor[torch.argsort(keep_scores, descending=True)]
+
     def _build_gt_all_instances_objective(
         self,
         outputs: torch.Tensor,
@@ -286,28 +325,63 @@ class DetectionTaskAdapter(TaskAdapter):
         This term targets false positives of type-2 (wrong location / no matching GT).
         """
         eps = 1e-8
-        iou_threshold = float(context.get('det_fp_loc_iou_threshold', 0.3))
-        gate_sharpness = float(context.get('det_fp_loc_gate_sharpness', 12.0))
+        conf_threshold = float(context.get('det_conf_threshold', 0.3))
+        nms_iou_threshold = float(context.get('det_nms_iou_threshold', 0.45))
+        loc_iou_threshold = float(
+            context.get(
+                'det_fp_loc_iou_threshold',
+                context.get('det_match_iou_threshold', 0.5),
+            )
+        )
         score_power = float(context.get('det_fp_loc_score_power', 1.0))
 
         obj = outputs[:, :, 4:5]
         cls = outputs[:, :, 5:]
-        scores = (obj * cls).max(dim=2).values
+        pred_scores = obj * cls
+        scores, cls_ids = pred_scores.max(dim=2)
 
         per_image_losses = []
         for bidx in range(outputs.size(0)):
             pred_boxes = self._cxcywh_to_xyxy(outputs[bidx, :, :4])
+            pred_cls_ids = cls_ids[bidx]
+            pred_score = scores[bidx]
+
+            conf_mask = pred_score >= conf_threshold
+            if conf_mask.sum() == 0:
+                per_image_losses.append(pred_score.sum() * 0.0)
+                continue
+
+            pred_boxes = pred_boxes[conf_mask]
+            pred_cls_ids = pred_cls_ids[conf_mask]
+            pred_score = pred_score[conf_mask]
+
+            keep = self._nms_indices_by_class(
+                pred_boxes,
+                pred_cls_ids,
+                pred_score,
+                iou_threshold=nms_iou_threshold,
+            )
+            if keep.numel() == 0:
+                per_image_losses.append(pred_score.sum() * 0.0)
+                continue
+
+            pred_boxes = pred_boxes[keep]
+            pred_score = pred_score[keep]
             gt_boxes = gt_instances[bidx]['boxes_xyxy'].to(device=outputs.device, dtype=outputs.dtype)
 
             if gt_boxes.numel() == 0:
-                max_iou = torch.zeros(pred_boxes.size(0), device=outputs.device, dtype=outputs.dtype)
+                fp_loc_scores = pred_score
             else:
                 ious = [self._box_iou_xyxy_vec(pred_boxes, gt_boxes[gidx]) for gidx in range(gt_boxes.size(0))]
                 max_iou = torch.stack(ious, dim=1).max(dim=1).values
+                fp_loc_mask = max_iou < loc_iou_threshold
+                fp_loc_scores = pred_score[fp_loc_mask]
 
-            fp_gate = torch.sigmoid(gate_sharpness * (iou_threshold - max_iou))
-            fp_score = torch.pow(scores[bidx].clamp_min(eps), score_power)
-            per_image_losses.append(torch.mean(fp_gate * fp_score))
+            if fp_loc_scores.numel() == 0:
+                per_image_losses.append(pred_score.sum() * 0.0)
+                continue
+
+            per_image_losses.append(torch.mean(torch.pow(fp_loc_scores.clamp_min(eps), score_power)))
 
         return torch.stack(per_image_losses).mean()
 
