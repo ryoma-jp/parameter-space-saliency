@@ -275,6 +275,42 @@ class DetectionTaskAdapter(TaskAdapter):
 
         return torch.stack(per_image_losses).mean()
 
+    def _build_fp_loc_objective(
+        self,
+        outputs: torch.Tensor,
+        gt_instances: List[Dict[str, torch.Tensor]],
+        context: Dict[str, Any],
+    ) -> torch.Tensor:
+        """Penalize high-confidence predictions at locations with low IoU to any GT.
+
+        This term targets false positives of type-2 (wrong location / no matching GT).
+        """
+        eps = 1e-8
+        iou_threshold = float(context.get('det_fp_loc_iou_threshold', 0.3))
+        gate_sharpness = float(context.get('det_fp_loc_gate_sharpness', 12.0))
+        score_power = float(context.get('det_fp_loc_score_power', 1.0))
+
+        obj = outputs[:, :, 4:5]
+        cls = outputs[:, :, 5:]
+        scores = (obj * cls).max(dim=2).values
+
+        per_image_losses = []
+        for bidx in range(outputs.size(0)):
+            pred_boxes = self._cxcywh_to_xyxy(outputs[bidx, :, :4])
+            gt_boxes = gt_instances[bidx]['boxes_xyxy'].to(device=outputs.device, dtype=outputs.dtype)
+
+            if gt_boxes.numel() == 0:
+                max_iou = torch.zeros(pred_boxes.size(0), device=outputs.device, dtype=outputs.dtype)
+            else:
+                ious = [self._box_iou_xyxy_vec(pred_boxes, gt_boxes[gidx]) for gidx in range(gt_boxes.size(0))]
+                max_iou = torch.stack(ious, dim=1).max(dim=1).values
+
+            fp_gate = torch.sigmoid(gate_sharpness * (iou_threshold - max_iou))
+            fp_score = torch.pow(scores[bidx].clamp_min(eps), score_power)
+            per_image_losses.append(torch.mean(fp_gate * fp_score))
+
+        return torch.stack(per_image_losses).mean()
+
     def _resolve_targets_from_gt(
         self,
         gt_instances: List[Dict[str, torch.Tensor]],
@@ -298,6 +334,7 @@ class DetectionTaskAdapter(TaskAdapter):
         context = dict(objective_context or {})
         objective_mode = str(context.get('det_objective_mode', self.objective_mode))
         provider_strict = bool(context.get('det_provider_strict', self.provider_strict))
+        fp_loc_weight = float(context.get('det_fp_loc_weight', 0.0))
 
         if objective_mode == 'legacy_single_class':
             outputs = model(inputs)
@@ -328,6 +365,13 @@ class DetectionTaskAdapter(TaskAdapter):
 
         if provider is not None:
             loss = provider.build_objective(model, inputs, gt_instances, context)
+            if fp_loc_weight > 0.0:
+                outputs_fp = model(inputs)
+                if outputs_fp.ndim != 3 or outputs_fp.size(-1) < 6:
+                    raise ValueError(
+                        'DetectionTaskAdapter expects model outputs shaped as (B, N, 5 + C).'
+                    )
+                loss = loss + fp_loc_weight * self._build_fp_loc_objective(outputs_fp, gt_instances, context)
             return loss, self._resolve_targets_from_gt(gt_instances, true_labels)
 
         outputs = model(inputs)
@@ -345,6 +389,8 @@ class DetectionTaskAdapter(TaskAdapter):
                 f"Unknown detection objective mode: '{objective_mode}'. "
                 "Choose 'gt_all_instances', 'gt_all_classes', or 'legacy_single_class'."
             )
+        if fp_loc_weight > 0.0:
+            loss = loss + fp_loc_weight * self._build_fp_loc_objective(outputs, gt_instances, context)
         return loss, self._resolve_targets_from_gt(gt_instances, true_labels)
 
     def build_objective_components(
@@ -357,6 +403,7 @@ class DetectionTaskAdapter(TaskAdapter):
     ) -> Dict[str, torch.Tensor]:
         context = dict(objective_context or {})
         objective_mode = str(context.get('det_objective_mode', self.objective_mode))
+        fp_loc_weight = float(context.get('det_fp_loc_weight', 0.0))
 
         if objective_mode == 'legacy_single_class':
             loss, _ = self.build_objective(
@@ -376,7 +423,17 @@ class DetectionTaskAdapter(TaskAdapter):
 
         provider = self._resolve_provider(model, context)
         if provider is not None:
-            return provider.build_objective_components(model, inputs, gt_instances, context)
+            components = dict(provider.build_objective_components(model, inputs, gt_instances, context))
+            if fp_loc_weight > 0.0:
+                outputs_fp = model(inputs)
+                if outputs_fp.ndim != 3 or outputs_fp.size(-1) < 6:
+                    raise ValueError(
+                        'DetectionTaskAdapter expects model outputs shaped as (B, N, 5 + C).'
+                    )
+                fp_loc = self._build_fp_loc_objective(outputs_fp, gt_instances, context)
+                components['fp_loc'] = fp_loc
+                components['total'] = components['total'] + fp_loc_weight * fp_loc
+            return components
 
         loss, _ = self.build_objective(
             model,

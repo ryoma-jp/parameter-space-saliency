@@ -120,6 +120,14 @@ parser.add_argument('--det_iou_weight', default=3.0, type=float,
                     help='weight of IoU term in gt_all_instances objective')
 parser.add_argument('--det_score_weight', default=1.0, type=float,
                     help='weight of class-score term in gt_all_instances objective')
+parser.add_argument('--det_fp_loc_weight', default=0.0, type=float,
+                    help='weight of location-FP term (0 disables)')
+parser.add_argument('--det_fp_loc_iou_threshold', default=0.3, type=float,
+                    help='IoU threshold below which predictions are treated as location-FP-like')
+parser.add_argument('--det_fp_loc_gate_sharpness', default=12.0, type=float,
+                    help='sigmoid sharpness for low-IoU FP gating')
+parser.add_argument('--det_fp_loc_score_power', default=1.0, type=float,
+                    help='power applied to prediction score in location-FP term')
 parser.add_argument('--input_saliency_method',
                 default='auto',
                 choices=['auto', 'matching', 'direct_loss'],
@@ -234,9 +242,18 @@ def _save_gradient_visualization(
     ax.imshow(heatmap_superimposed)
 
     if detection_overlay is not None:
-        color_map = {'tp': 'lime', 'fp': 'red', 'fn': 'yellow'}
+        color_map = {
+            'tp': 'lime',
+            'fp': 'red',
+            'fp_cls': 'red',
+            'fp_loc': 'orange',
+            'fn': 'yellow',
+        }
         class_names = detection_overlay.get('class_names', {})
-        for key in ('tp', 'fp', 'fn'):
+        has_split_fp = ('fp_cls' in detection_overlay) or ('fp_loc' in detection_overlay)
+        draw_keys = ('tp', 'fp_cls', 'fp_loc', 'fn') if has_split_fp else ('tp', 'fp', 'fn')
+
+        for key in draw_keys:
             for item in detection_overlay.get(key, []):
                 x1, y1, x2, y2 = item['box']
                 cls_id = int(item.get('cls_id', -1))
@@ -264,6 +281,58 @@ def _save_gradient_visualization(
     ax.axis('off')
     fig.savefig(out_path, bbox_inches='tight')
     plt.close(fig)
+
+
+def _save_detection_box_overlays(
+    reference_image,
+    inv_transform_test,
+    detection_overlay,
+    output_dir,
+):
+    if detection_overlay is None:
+        return
+
+    os.makedirs(output_dir, exist_ok=True)
+    reference_image_to_compare = inv_transform_test(reference_image[0].cpu()).permute(1, 2, 0)
+    image_np = reference_image_to_compare.detach().cpu().numpy()
+    class_names = detection_overlay.get('class_names', {})
+
+    render_specs = [
+        ('detection_boxes_gt_only.png', detection_overlay.get('gt', []), 'yellow'),
+        ('detection_boxes_pred_only.png', detection_overlay.get('pred', []), 'red'),
+    ]
+
+    for file_name, items, color in render_specs:
+        fig, ax = plt.subplots()
+        ax.imshow(image_np)
+
+        for item in items:
+            x1, y1, x2, y2 = item['box']
+            cls_id = int(item.get('cls_id', -1))
+            cls_name = class_names.get(cls_id, str(cls_id)) if cls_id >= 0 else 'unknown'
+            rect = Rectangle(
+                (x1, y1),
+                max(1.0, x2 - x1),
+                max(1.0, y2 - y1),
+                fill=False,
+                edgecolor=color,
+                linewidth=2.0,
+            )
+            ax.add_patch(rect)
+            ax.text(
+                x1,
+                max(0.0, y1 - 2.0),
+                cls_name,
+                color=color,
+                fontsize=8,
+                fontweight='bold',
+                ha='left',
+                va='bottom',
+            )
+
+        ax.axis('off')
+        fig.savefig(os.path.join(output_dir, file_name), bbox_inches='tight')
+        plt.close(fig)
 
 
 def _summarize_distribution(values: np.ndarray) -> dict:
@@ -307,17 +376,35 @@ def _clip_box_to_map(box, map_hw):
 
 
 def _build_overlay_group_stats(normalized_map: np.ndarray, detection_overlay: dict) -> dict:
+    fp_items = detection_overlay.get('fp', [])
+    fp_cls_items = detection_overlay.get('fp_cls', [])
+    fp_loc_items = detection_overlay.get('fp_loc', [])
+
+    # Backward compatibility: if split FP keys exist but aggregate FP key is absent,
+    # compute aggregate FP as union of class/location FP groups.
+    if not fp_items and (fp_cls_items or fp_loc_items):
+        fp_items = list(fp_cls_items) + list(fp_loc_items)
+
     out = {
         'overlay_counts': {
             'tp': int(len(detection_overlay.get('tp', []))),
-            'fp': int(len(detection_overlay.get('fp', []))),
+            'fp': int(len(fp_items)),
+            'fp_cls': int(len(fp_cls_items)),
+            'fp_loc': int(len(fp_loc_items)),
             'fn': int(len(detection_overlay.get('fn', []))),
         },
         'groups': {},
     }
 
-    for key in ('tp', 'fp', 'fn'):
-        items = detection_overlay.get(key, [])
+    group_items = {
+        'tp': detection_overlay.get('tp', []),
+        'fp': fp_items,
+        'fp_cls': fp_cls_items,
+        'fp_loc': fp_loc_items,
+        'fn': detection_overlay.get('fn', []),
+    }
+
+    for key, items in group_items.items():
         box_means = []
         box_medians = []
         pixel_values = []
@@ -371,6 +458,10 @@ def _save_component_gradient_exports(
         'model_class_path': args.model_class_path,
         'objective_provider': args.det_objective_provider,
         'objective_mode': args.det_objective_mode,
+        'det_fp_loc_weight': args.det_fp_loc_weight,
+        'det_fp_loc_iou_threshold': args.det_fp_loc_iou_threshold,
+        'det_fp_loc_gate_sharpness': args.det_fp_loc_gate_sharpness,
+        'det_fp_loc_score_power': args.det_fp_loc_score_power,
         'input_saliency_method': args.input_saliency_method,
         'noise_iters': args.noise_iters,
         'noise_percent': args.noise_percent,
@@ -556,6 +647,10 @@ def _build_detection_objective_context(args, reference_image):
         'det_provider_strict': args.det_provider_strict,
         'det_iou_weight': args.det_iou_weight,
         'det_score_weight': args.det_score_weight,
+        'det_fp_loc_weight': args.det_fp_loc_weight,
+        'det_fp_loc_iou_threshold': args.det_fp_loc_iou_threshold,
+        'det_fp_loc_gate_sharpness': args.det_fp_loc_gate_sharpness,
+        'det_fp_loc_score_power': args.det_fp_loc_score_power,
     }
 
     if args.det_objective_mode == 'legacy_single_class':
@@ -614,7 +709,16 @@ def _build_detection_overlay(reference_image, net, args):
     scores = scores[conf_mask]
 
     if boxes_xyxy.shape[0] == 0:
-        return {'tp': [], 'fp': [], 'fn': [], 'class_names': {}}
+        return {
+            'tp': [],
+            'fp': [],
+            'fp_cls': [],
+            'fp_loc': [],
+            'fn': [],
+            'gt': [],
+            'pred': [],
+            'class_names': {},
+        }
 
     keep = _nms_by_class(boxes_xyxy, cls_ids, scores, float(args.det_nms_iou_threshold))
     boxes_xyxy = boxes_xyxy[keep]
@@ -629,51 +733,85 @@ def _build_detection_overlay(reference_image, net, args):
     gt_boxes, gt_classes, class_names = _load_coco_gt_for_image(args, image_hw=(h, w))
     if len(gt_boxes) == 0:
         # GT が無い場合は全予測をFPとして描画して注意喚起する。
+        fp_loc_boxes = [
+            {'box': boxes_xyxy[i].tolist(), 'cls_id': int(cls_ids[i])}
+            for i in range(boxes_xyxy.shape[0])
+        ]
         return {
             'tp': [],
-            'fp': [
-                {'box': boxes_xyxy[i].tolist(), 'cls_id': int(cls_ids[i])}
-                for i in range(boxes_xyxy.shape[0])
-            ],
+            'fp': fp_loc_boxes,
+            'fp_cls': [],
+            'fp_loc': fp_loc_boxes,
             'fn': [],
+            'gt': [],
+            'pred': fp_loc_boxes,
             'class_names': class_names,
         }
 
     gt_boxes = np.array(gt_boxes, dtype=np.float32)
     gt_classes = np.array(gt_classes, dtype=np.int64)
+    gt_overlay_boxes = [
+        {'box': gt_boxes[g].tolist(), 'cls_id': int(gt_classes[g])}
+        for g in range(len(gt_boxes))
+    ]
+    pred_overlay_boxes = [
+        {'box': boxes_xyxy[p].tolist(), 'cls_id': int(cls_ids[p])}
+        for p in range(boxes_xyxy.shape[0])
+    ]
 
     pred_order = np.argsort(scores)[::-1]
     matched_gt = np.zeros(len(gt_boxes), dtype=bool)
     tp_boxes = []
-    fp_boxes = []
+    fp_cls_boxes = []
+    fp_loc_boxes = []
 
     iou_thr = float(args.det_match_iou_threshold)
     for pidx in pred_order:
         pbox = boxes_xyxy[pidx]
         pcls = cls_ids[pidx]
 
-        candidate = np.where((gt_classes == pcls) & (~matched_gt))[0]
-        if candidate.size == 0:
-            fp_boxes.append({'box': pbox.tolist(), 'cls_id': int(pcls)})
-            continue
+        # 1) Try regular TP matching first (same class + IoU threshold).
+        candidate_same_cls = np.where((gt_classes == pcls) & (~matched_gt))[0]
+        if candidate_same_cls.size > 0:
+            ious_same = np.array([_box_iou_xyxy(pbox, gt_boxes[g]) for g in candidate_same_cls], dtype=np.float32)
+            best_same_local = int(np.argmax(ious_same))
+            best_same_iou = float(ious_same[best_same_local])
+            best_same_gt = int(candidate_same_cls[best_same_local])
 
-        ious = np.array([_box_iou_xyxy(pbox, gt_boxes[g]) for g in candidate], dtype=np.float32)
-        best_local = int(np.argmax(ious))
-        best_iou = float(ious[best_local])
-        best_gt = int(candidate[best_local])
+            if best_same_iou >= iou_thr:
+                matched_gt[best_same_gt] = True
+                tp_boxes.append({'box': pbox.tolist(), 'cls_id': int(pcls)})
+                continue
 
-        if best_iou >= iou_thr:
-            matched_gt[best_gt] = True
-            tp_boxes.append({'box': pbox.tolist(), 'cls_id': int(pcls)})
-        else:
-            fp_boxes.append({'box': pbox.tolist(), 'cls_id': int(pcls)})
+        # 2) If localization overlaps a GT but class is wrong, mark as FP(class).
+        candidate_any_cls = np.where(~matched_gt)[0]
+        if candidate_any_cls.size > 0:
+            ious_any = np.array([_box_iou_xyxy(pbox, gt_boxes[g]) for g in candidate_any_cls], dtype=np.float32)
+            best_any_local = int(np.argmax(ious_any))
+            best_any_iou = float(ious_any[best_any_local])
+            best_any_gt = int(candidate_any_cls[best_any_local])
+            if best_any_iou >= iou_thr and int(gt_classes[best_any_gt]) != int(pcls):
+                fp_cls_boxes.append({'box': pbox.tolist(), 'cls_id': int(pcls)})
+                continue
+
+        # 3) Otherwise, treat as FP(location): no sufficient overlap with any GT.
+        fp_loc_boxes.append({'box': pbox.tolist(), 'cls_id': int(pcls)})
 
     fn_indices = np.where(~matched_gt)[0]
     fn_boxes = [
         {'box': gt_boxes[g].tolist(), 'cls_id': int(gt_classes[g])}
         for g in fn_indices
     ]
-    return {'tp': tp_boxes, 'fp': fp_boxes, 'fn': fn_boxes, 'class_names': class_names}
+    return {
+        'tp': tp_boxes,
+        'fp': fp_cls_boxes + fp_loc_boxes,
+        'fp_cls': fp_cls_boxes,
+        'fp_loc': fp_loc_boxes,
+        'fn': fn_boxes,
+        'gt': gt_overlay_boxes,
+        'pred': pred_overlay_boxes,
+        'class_names': class_names,
+    }
 
 
 def _reference_output_key(args) -> str:
@@ -1177,6 +1315,14 @@ if __name__ == '__main__':
     print(f'Input tensor saved to {input_tensor_path}')
 
     detection_overlay = _build_detection_overlay(reference_image, net, args)
+    if detection_overlay is not None:
+        per_image_dir = os.path.join(args.output_root, _reference_output_key(args))
+        _save_detection_box_overlays(
+            reference_image,
+            inv_transform_test,
+            detection_overlay,
+            per_image_dir,
+        )
     _export_intermediate_features(reference_image, net, adapter, args, testset)
     save_gradients(
         grads_to_save,
