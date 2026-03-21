@@ -29,6 +29,15 @@ class DetectionObjectiveProvider(ABC):
     ) -> torch.Tensor:
         ...
 
+    def build_objective_components(
+        self,
+        model: nn.Module,
+        inputs: torch.Tensor,
+        gt_instances: List[Dict[str, torch.Tensor]],
+        context: Dict[str, Any],
+    ) -> Dict[str, torch.Tensor]:
+        return {'total': self.build_objective(model, inputs, gt_instances, context)}
+
 
 class YOLOXOfficialLossProvider(DetectionObjectiveProvider):
     """Use YOLOX official training loss by forwarding (inputs, labels)."""
@@ -46,13 +55,28 @@ class YOLOXOfficialLossProvider(DetectionObjectiveProvider):
         gt_instances: List[Dict[str, torch.Tensor]],
         context: Dict[str, Any],
     ) -> torch.Tensor:
+        components = self.build_objective_components(model, inputs, gt_instances, context)
+        return components['total']
+
+    def build_objective_components(
+        self,
+        model: nn.Module,
+        inputs: torch.Tensor,
+        gt_instances: List[Dict[str, torch.Tensor]],
+        context: Dict[str, Any],
+    ) -> Dict[str, torch.Tensor]:
         labels = self._build_yolox_labels(inputs, gt_instances)
         with self._training_forward_mode(model):
             out = model(inputs, labels)
 
         if not isinstance(out, dict) or 'total_loss' not in out:
             raise ValueError("YOLOX official objective expects dict output with key 'total_loss'.")
-        return out['total_loss']
+        return {
+            'total': out['total_loss'],
+            'obj': out['conf_loss'],
+            'cls': out['cls_loss'],
+            'iou': out['iou_loss'],
+        }
 
     def _build_yolox_labels(
         self,
@@ -322,6 +346,46 @@ class DetectionTaskAdapter(TaskAdapter):
                 "Choose 'gt_all_instances', 'gt_all_classes', or 'legacy_single_class'."
             )
         return loss, self._resolve_targets_from_gt(gt_instances, true_labels)
+
+    def build_objective_components(
+        self,
+        model: nn.Module,
+        inputs: torch.Tensor,
+        true_labels: torch.Tensor,
+        target_spec: TargetSpec,
+        objective_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, torch.Tensor]:
+        context = dict(objective_context or {})
+        objective_mode = str(context.get('det_objective_mode', self.objective_mode))
+
+        if objective_mode == 'legacy_single_class':
+            loss, _ = self.build_objective(
+                model,
+                inputs,
+                true_labels,
+                target_spec,
+                objective_context=objective_context,
+            )
+            return {'total': loss}
+
+        gt_instances = context.get('det_gt_instances')
+        if gt_instances is None:
+            raise ValueError(
+                "det_gt_instances is required for detection objective modes other than 'legacy_single_class'."
+            )
+
+        provider = self._resolve_provider(model, context)
+        if provider is not None:
+            return provider.build_objective_components(model, inputs, gt_instances, context)
+
+        loss, _ = self.build_objective(
+            model,
+            inputs,
+            true_labels,
+            target_spec,
+            objective_context=objective_context,
+        )
+        return {'total': loss}
 
     def summarize_prediction(
         self,

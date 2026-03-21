@@ -120,6 +120,12 @@ parser.add_argument('--det_iou_weight', default=3.0, type=float,
                     help='weight of IoU term in gt_all_instances objective')
 parser.add_argument('--det_score_weight', default=1.0, type=float,
                     help='weight of class-score term in gt_all_instances objective')
+parser.add_argument('--input_saliency_method',
+                default='auto',
+                choices=['auto', 'matching', 'direct_loss'],
+                help='how to compute input-space saliency gradients: '
+                    'matching (original PSS), direct_loss (dL/dx), or auto '
+                    '(classification=matching, detection=direct_loss)')
 
 def _cache_key(args) -> str:
     """Derive a filesystem-safe cache key from model arguments."""
@@ -168,6 +174,246 @@ def _build_model_spec(args) -> dict:
     if args.state_dict_target_path:
         spec['state_dict_target_path'] = args.state_dict_target_path
     return spec
+
+
+def _resolve_input_saliency_method(args) -> str:
+    method = str(args.input_saliency_method)
+    if method == 'auto':
+        return 'direct_loss' if args.task == 'detection' else 'matching'
+    return method
+
+
+def _reference_save_name(args) -> str:
+    save_name = (str(args.reference_id) if args.reference_id is not None
+                 else args.image_path.split('/')[-1].split('.')[0])
+    save_name += '_' + _cache_key(args)
+    return save_name
+
+
+def _prepare_gradient_arrays(grads: torch.Tensor) -> dict:
+    raw_grad = grads[0].detach().cpu().numpy()
+    abs_map = np.abs(raw_grad).max(axis=0)
+
+    clipped_map = abs_map.copy()
+    hi = np.percentile(clipped_map, 99)
+    lo = np.percentile(clipped_map, 90)
+    clipped_map[clipped_map > hi] = hi
+    clipped_map[clipped_map < lo] = lo
+
+    denom = np.max(clipped_map) - np.min(clipped_map)
+    if denom <= 1e-12:
+        normalized_map = np.zeros_like(clipped_map)
+    else:
+        normalized_map = (clipped_map - np.min(clipped_map)) / denom
+
+    heatmap_mask = np.ones_like(normalized_map) - normalized_map
+    heatmap_mask = cv2.GaussianBlur(heatmap_mask, (3, 3), 0)
+
+    return {
+        'raw_grad': raw_grad,
+        'abs_map': abs_map,
+        'normalized_map': normalized_map,
+        'heatmap_mask': heatmap_mask,
+        'percentile_low': float(lo),
+        'percentile_high': float(hi),
+    }
+
+
+def _save_gradient_visualization(
+    heatmap_mask: np.ndarray,
+    out_path: str,
+    reference_image,
+    inv_transform_test,
+    detection_overlay=None,
+):
+    reference_image_to_compare = inv_transform_test(reference_image[0].cpu()).permute(1, 2, 0)
+    heatmap_superimposed = show_heatmap_on_image(
+        reference_image_to_compare.detach().cpu().numpy(), heatmap_mask
+    )
+    fig, ax = plt.subplots()
+    ax.imshow(heatmap_superimposed)
+
+    if detection_overlay is not None:
+        color_map = {'tp': 'lime', 'fp': 'red', 'fn': 'yellow'}
+        class_names = detection_overlay.get('class_names', {})
+        for key in ('tp', 'fp', 'fn'):
+            for item in detection_overlay.get(key, []):
+                x1, y1, x2, y2 = item['box']
+                cls_id = int(item.get('cls_id', -1))
+                cls_name = class_names.get(cls_id, str(cls_id)) if cls_id >= 0 else 'unknown'
+                rect = Rectangle(
+                    (x1, y1),
+                    max(1.0, x2 - x1),
+                    max(1.0, y2 - y1),
+                    fill=False,
+                    edgecolor=color_map[key],
+                    linewidth=2.0,
+                )
+                ax.add_patch(rect)
+                ax.text(
+                    x1,
+                    max(0.0, y1 - 2.0),
+                    cls_name,
+                    color=color_map[key],
+                    fontsize=8,
+                    fontweight='bold',
+                    ha='left',
+                    va='bottom',
+                )
+
+    ax.axis('off')
+    fig.savefig(out_path, bbox_inches='tight')
+    plt.close(fig)
+
+
+def _summarize_distribution(values: np.ndarray) -> dict:
+    if values.size == 0:
+        return {
+            'count': 0,
+            'mean': None,
+            'std': None,
+            'min': None,
+            'max': None,
+            'q25': None,
+            'median': None,
+            'q75': None,
+            'q90': None,
+            'q95': None,
+        }
+
+    values = values.astype(np.float64)
+    return {
+        'count': int(values.size),
+        'mean': float(np.mean(values)),
+        'std': float(np.std(values)),
+        'min': float(np.min(values)),
+        'max': float(np.max(values)),
+        'q25': float(np.percentile(values, 25)),
+        'median': float(np.percentile(values, 50)),
+        'q75': float(np.percentile(values, 75)),
+        'q90': float(np.percentile(values, 90)),
+        'q95': float(np.percentile(values, 95)),
+    }
+
+
+def _clip_box_to_map(box, map_hw):
+    x1, y1, x2, y2 = box
+    h, w = map_hw
+    x1 = int(max(0, min(w - 1, np.floor(x1))))
+    y1 = int(max(0, min(h - 1, np.floor(y1))))
+    x2 = int(max(0, min(w, np.ceil(x2))))
+    y2 = int(max(0, min(h, np.ceil(y2))))
+    return x1, y1, x2, y2
+
+
+def _build_overlay_group_stats(normalized_map: np.ndarray, detection_overlay: dict) -> dict:
+    out = {
+        'overlay_counts': {
+            'tp': int(len(detection_overlay.get('tp', []))),
+            'fp': int(len(detection_overlay.get('fp', []))),
+            'fn': int(len(detection_overlay.get('fn', []))),
+        },
+        'groups': {},
+    }
+
+    for key in ('tp', 'fp', 'fn'):
+        items = detection_overlay.get(key, [])
+        box_means = []
+        box_medians = []
+        pixel_values = []
+
+        for item in items:
+            x1, y1, x2, y2 = _clip_box_to_map(item['box'], normalized_map.shape)
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            patch = normalized_map[y1:y2, x1:x2]
+            if patch.size == 0:
+                continue
+
+            box_means.append(float(np.mean(patch)))
+            box_medians.append(float(np.median(patch)))
+            pixel_values.append(patch.reshape(-1))
+
+        pixel_values = np.concatenate(pixel_values) if pixel_values else np.array([], dtype=np.float64)
+        out['groups'][key] = {
+            'box_mean_distribution': _summarize_distribution(np.array(box_means, dtype=np.float64)),
+            'box_median_distribution': _summarize_distribution(np.array(box_medians, dtype=np.float64)),
+            'pixel_distribution': _summarize_distribution(pixel_values),
+        }
+
+    return out
+
+
+def _save_component_gradient_exports(
+    component_gradients: dict,
+    component_losses: dict,
+    args,
+    reference_image,
+    inv_transform_test,
+    detection_overlay=None,
+):
+    if not component_gradients:
+        return
+
+    save_name = _reference_save_name(args)
+    root_dir = os.path.join(args.output_root, 'loss_component_saliency')
+    raw_dir = os.path.join(root_dir, 'raw_gradients')
+    map_dir = os.path.join(root_dir, 'maps')
+    image_dir = os.path.join(root_dir, 'images')
+    os.makedirs(raw_dir, exist_ok=True)
+    os.makedirs(map_dir, exist_ok=True)
+    os.makedirs(image_dir, exist_ok=True)
+
+    metadata = {
+        'image_path': args.image_path,
+        'reference_id': args.reference_id,
+        'model_class_path': args.model_class_path,
+        'objective_provider': args.det_objective_provider,
+        'objective_mode': args.det_objective_mode,
+        'input_saliency_method': args.input_saliency_method,
+        'noise_iters': args.noise_iters,
+        'noise_percent': args.noise_percent,
+        'aggregation': 'max_abs_over_channels',
+        'normalization': 'clip_to_p90_p99_then_minmax',
+        'normalized_map_overlay_statistics': {},
+        'components': {},
+    }
+
+    for component_name, grads in component_gradients.items():
+        arrays = _prepare_gradient_arrays(grads)
+        np.save(os.path.join(raw_dir, f'{save_name}_{component_name}_raw_grad.npy'), arrays['raw_grad'])
+        np.save(os.path.join(map_dir, f'{save_name}_{component_name}_abs_map.npy'), arrays['abs_map'])
+        np.save(os.path.join(map_dir, f'{save_name}_{component_name}_normalized_map.npy'), arrays['normalized_map'])
+
+        image_path = os.path.join(image_dir, f'input_saliency_heatmap_{save_name}_{component_name}.png')
+        _save_gradient_visualization(
+            arrays['heatmap_mask'],
+            image_path,
+            reference_image,
+            inv_transform_test,
+            detection_overlay=detection_overlay,
+        )
+
+        metadata['components'][component_name] = {
+            'loss_value': float(component_losses.get(component_name, float('nan'))),
+            'percentile_low': arrays['percentile_low'],
+            'percentile_high': arrays['percentile_high'],
+            'raw_gradient_path': os.path.join('raw_gradients', f'{save_name}_{component_name}_raw_grad.npy'),
+            'abs_map_path': os.path.join('maps', f'{save_name}_{component_name}_abs_map.npy'),
+            'normalized_map_path': os.path.join('maps', f'{save_name}_{component_name}_normalized_map.npy'),
+            'image_path': os.path.join('images', f'input_saliency_heatmap_{save_name}_{component_name}.png'),
+        }
+
+        if detection_overlay is not None:
+            metadata['normalized_map_overlay_statistics'][component_name] = _build_overlay_group_stats(
+                arrays['normalized_map'], detection_overlay
+            )
+
+    metadata_path = os.path.join(root_dir, f'{save_name}_metadata.json')
+    with open(metadata_path, 'w', encoding='utf-8') as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
+    print(f'Loss component saliency saved under {root_dir}')
 
 
 def _resolve_detection_annotations_path(args) -> str:
@@ -569,69 +815,69 @@ def _export_model_checkpoint(model, args) -> None:
 
 
 def save_gradients(grads_to_save, args, reference_image, inv_transform_test, detection_overlay=None):
-    grads_to_save, _ = grads_to_save.max(dim=1)
-    grads_to_save = grads_to_save[0].detach().cpu().numpy()
-    grads_to_save = np.abs(grads_to_save)
-    # grads_to_save[grads_to_save < 0] = 0.0
-
-    #Percentile thresholding
-    grads_to_save[grads_to_save > np.percentile(grads_to_save, 99)] = np.percentile(grads_to_save, 99)
-    grads_to_save[grads_to_save < np.percentile(grads_to_save, 90)] = np.percentile(grads_to_save, 90)
-
+    arrays = _prepare_gradient_arrays(grads_to_save)
     save_path = os.path.join(args.output_root, args.figure_folder_name)
     os.makedirs(save_path, exist_ok=True)
-    ck = _cache_key(args)
-    save_name = (str(args.reference_id) if args.reference_id is not None
-                 else args.image_path.split('/')[-1].split('.')[0])
-    save_name += '_' + ck
+    save_name = _reference_save_name(args)
     plt.axis('off')
-
-    grads_to_save = (grads_to_save - np.min(grads_to_save)) / (np.max(grads_to_save) - np.min(grads_to_save))
-
-    reference_image_to_compare = inv_transform_test(reference_image[0].cpu()).permute(1, 2, 0)
-    gradients_heatmap = np.ones_like(grads_to_save) - grads_to_save
-    gradients_heatmap = cv2.GaussianBlur(gradients_heatmap, (3, 3), 0)
-
-    heatmap_superimposed = show_heatmap_on_image(
-        reference_image_to_compare.detach().cpu().numpy(), gradients_heatmap
-    )
-    fig, ax = plt.subplots()
-    ax.imshow(heatmap_superimposed)
-
-    if detection_overlay is not None:
-        color_map = {'tp': 'lime', 'fp': 'red', 'fn': 'yellow'}
-        class_names = detection_overlay.get('class_names', {})
-        for key in ('tp', 'fp', 'fn'):
-            for item in detection_overlay.get(key, []):
-                x1, y1, x2, y2 = item['box']
-                cls_id = int(item.get('cls_id', -1))
-                cls_name = class_names.get(cls_id, str(cls_id)) if cls_id >= 0 else 'unknown'
-                rect = Rectangle(
-                    (x1, y1),
-                    max(1.0, x2 - x1),
-                    max(1.0, y2 - y1),
-                    fill=False,
-                    edgecolor=color_map[key],
-                    linewidth=2.0,
-                )
-                ax.add_patch(rect)
-                ax.text(
-                    x1,
-                    max(0.0, y1 - 2.0),
-                    cls_name,
-                    color=color_map[key],
-                    fontsize=8,
-                    fontweight='bold',
-                    ha='left',
-                    va='bottom',
-                )
-
-    ax.axis('off')
     out_path = os.path.join(save_path, f'input_saliency_heatmap_{save_name}.png')
-    fig.savefig(out_path, bbox_inches='tight')
-    plt.close(fig)
+    _save_gradient_visualization(
+        arrays['heatmap_mask'],
+        out_path,
+        reference_image,
+        inv_transform_test,
+        detection_overlay=detection_overlay,
+    )
     print(f'Input space saliency saved to {out_path}\n')
     return
+
+
+def compute_detection_component_gradients(
+    reference_inputs,
+    reference_targets,
+    net,
+    args,
+    task_adapter,
+    target_spec,
+    objective_context=None,
+):
+    if args.task != 'detection' or not hasattr(task_adapter, 'build_objective_components'):
+        return {}, {}
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    reference_inputs = reference_inputs.to(device)
+    reference_targets = reference_targets.to(device)
+
+    component_samples = {}
+    component_losses = {}
+    for _ in range(args.noise_iters):
+        perturbed_inputs = reference_inputs.detach().clone()
+        perturbed_inputs = (
+            (1 - args.noise_percent) * perturbed_inputs
+            + args.noise_percent * torch.randn_like(perturbed_inputs)
+        )
+        perturbed_inputs.requires_grad_()
+
+        components = task_adapter.build_objective_components(
+            net,
+            perturbed_inputs,
+            reference_targets,
+            target_spec,
+            objective_context=objective_context,
+        )
+        for component_name, loss_tensor in components.items():
+            net.zero_grad()
+            if perturbed_inputs.grad is not None:
+                perturbed_inputs.grad.zero_()
+            loss_tensor.backward(retain_graph=(component_name != list(components.keys())[-1]))
+            component_samples.setdefault(component_name, []).append(perturbed_inputs.grad.detach().cpu().clone())
+            component_losses[component_name] = float(loss_tensor.detach().cpu().item())
+
+    averaged = {
+        component_name: torch.stack(samples).mean(0)
+        for component_name, samples in component_samples.items()
+    }
+    return averaged, component_losses
 
 def compute_input_space_saliency(
     reference_inputs, reference_targets, net, args,
@@ -641,6 +887,7 @@ def compute_input_space_saliency(
     objective_context=None,
 ):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    input_saliency_method = _resolve_input_saliency_method(args)
     saliency_mode = 'std'
     if testset_mean_stat is None or testset_std_stat is None:
         saliency_mode = 'naive'
@@ -671,28 +918,48 @@ def compute_input_space_saliency(
         )
         perturbed_inputs.requires_grad_()
 
-        filter_saliency = filter_saliency_model(
-            perturbed_inputs, reference_targets, target_spec,
-            testset_mean_abs_grad=testset_mean_stat,
-            testset_std_abs_grad=testset_std_stat,
-            objective_context=objective_context,
-        ).to(device)
-
-        if args.compare_random:
-            sorted_filters = torch.randperm(filter_saliency.size(0)).cpu().numpy()
+        if input_saliency_method == 'direct_loss':
+            net.zero_grad()
+            loss, _ = task_adapter.build_objective(
+                net,
+                perturbed_inputs,
+                reference_targets,
+                target_spec,
+                objective_context=objective_context,
+            )
+            loss.backward()
         else:
-            sorted_filters = torch.argsort(filter_saliency, descending=True).cpu().numpy()
+            filter_saliency = filter_saliency_model(
+                perturbed_inputs, reference_targets, target_spec,
+                testset_mean_abs_grad=testset_mean_stat,
+                testset_std_abs_grad=testset_std_stat,
+                objective_context=objective_context,
+            ).to(device)
 
-        filter_saliency_boosted = filter_saliency.detach().clone()
-        filter_saliency_boosted[sorted_filters[:args.k_salient]] *= args.boost_factor
+            if args.compare_random:
+                sorted_filters = torch.randperm(filter_saliency.size(0)).cpu().numpy()
+            else:
+                sorted_filters = torch.argsort(filter_saliency, descending=True).cpu().numpy()
 
-        matching_criterion = torch.nn.CosineSimilarity()
-        matching_loss = matching_criterion(
-            filter_saliency[None, :], filter_saliency_boosted[None, :]
-        )
-        matching_loss.backward()
+            filter_saliency_boosted = filter_saliency.detach().clone()
+            filter_saliency_boosted[sorted_filters[:args.k_salient]] *= args.boost_factor
+
+            matching_criterion = torch.nn.CosineSimilarity()
+            matching_loss = matching_criterion(
+                filter_saliency[None, :], filter_saliency_boosted[None, :]
+            )
+            matching_loss.backward()
 
         grad_samples.append(perturbed_inputs.grad.detach().cpu())
+
+    # Keep the filter saliency profile output for downstream plotting.
+    final_inputs = reference_inputs.detach().clone().requires_grad_(True)
+    filter_saliency = filter_saliency_model(
+        final_inputs, reference_targets, target_spec,
+        testset_mean_abs_grad=testset_mean_stat,
+        testset_std_abs_grad=testset_std_stat,
+        objective_context=objective_context,
+    ).to(device)
 
     grads_to_save = torch.stack(grad_samples).mean(0)
     return grads_to_save, filter_saliency
@@ -888,6 +1155,15 @@ if __name__ == '__main__':
         inv_transform_test, readable_labels,
         objective_context=objective_context,
     )
+    component_gradients, component_losses = compute_detection_component_gradients(
+        reference_image,
+        reference_target,
+        net,
+        args,
+        task_adapter,
+        target_spec,
+        objective_context=objective_context,
+    )
 
     layer_sorted_profile, _ = sort_filters_layer_wise(
         filter_saliency.detach().cpu().numpy(), layer_to_filter_id,
@@ -904,6 +1180,14 @@ if __name__ == '__main__':
     _export_intermediate_features(reference_image, net, adapter, args, testset)
     save_gradients(
         grads_to_save,
+        args,
+        reference_image,
+        inv_transform_test,
+        detection_overlay=detection_overlay,
+    )
+    _save_component_gradient_exports(
+        component_gradients,
+        component_losses,
         args,
         reference_image,
         inv_transform_test,
