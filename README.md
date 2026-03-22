@@ -57,25 +57,35 @@ Main outputs:
 ```text
 <output_root>/
     <image-id>/
-        input_tensor.npy
         filter_saliency_<image-id>_<model-key>.png
         input_space_saliency/
             input_saliency_heatmap_<image-id>_<model-key>.png
         loss_component_saliency/
-            raw_gradients/
-            maps/
             images/
             <image-id>_<model-key>_metadata.json
         feature_manifest.json
-        npy/
-            feat_<logical_name>.npy
         detection_boxes_gt_only.png
         detection_boxes_pred_only.png
 ```
 
 `loss_component_saliency/` is populated for detection task runs that produce component gradients.
 
-The script also exports intermediate feature tensors in the output directory using the same layout as the YOLOX tooling:
+Large `.npy` artifacts are disabled by default. To enable them, pass `--save_npy`.
+
+When `--save_npy` is enabled, additional files/directories are exported:
+
+```text
+<output_root>/
+    <image-id>/
+        input_tensor.npy
+        npy/
+            feat_<logical_name>.npy
+        loss_component_saliency/
+            raw_gradients/
+            maps/
+```
+
+When `--save_npy` is enabled, the script also exports intermediate feature tensors in the output directory using the same layout as the YOLOX tooling:
 
 ```text
 <output_root>/
@@ -85,7 +95,7 @@ The script also exports intermediate feature tensors in the output directory usi
             feat_<logical_name>.npy
 ```
 
-`feature_manifest.json` stores the logical layer name, actual module name, tensor shape, dtype, and relative `.npy` path for each exported feature tensor.
+`feature_manifest.json` stores the logical layer name, actual module name, tensor shape, dtype, and relative `.npy` path for each exported feature tensor. If `--save_npy` is not specified, `tensor_path` is `null`.
 
 To export the loaded model weights to a `.pth` checkpoint while running the script, pass `--export_model_pth`:
 
@@ -112,6 +122,7 @@ Below is a practical argument reference grouped by purpose.
 | `--task` | `classification` | Task adapter: `classification` or `detection`. |
 | `--output_root` | `figures` | Root output directory. |
 | `--figure_folder_name` | `input_space_saliency` | Subdirectory name for input-space saliency images (inside `<output_root>/<image-id>/`). |
+| `--save_npy` | off | Save large `.npy` artifacts (`input_tensor.npy`, feature `npy/`, detection loss-component maps). Disabled by default. |
 
 #### Image / dataset input
 
@@ -204,7 +215,7 @@ In exported box-only images:
 
 Demo
 -----
-The demo raw image is in `/raw_images`. The results are saved under `/figures/<image-id>/` by default.
+The demo raw image is in `/raw_images`. The results are saved under `/figures/<image-id>/` by default. Add `--save_npy` if you also want `.npy` artifacts.
 
 Using Custom Models
 -------------------

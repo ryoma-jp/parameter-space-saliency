@@ -68,6 +68,8 @@ parser.add_argument('--figure_folder_name', default='input_space_saliency', type
                     help='subdirectory under output_root for input-space figures')
 parser.add_argument('--output_root', default='figures', type=str,
                     help='root directory to save output figures')
+parser.add_argument('--save_npy', action='store_true',
+                    help='save large .npy artifacts (disabled by default)')
 
 # ----- Saliency options -----
 parser.add_argument('--signed', action='store_true', help='Use signed saliency')
@@ -448,8 +450,9 @@ def _save_component_gradient_exports(
     raw_dir = os.path.join(root_dir, 'raw_gradients')
     map_dir = os.path.join(root_dir, 'maps')
     image_dir = os.path.join(root_dir, 'images')
-    os.makedirs(raw_dir, exist_ok=True)
-    os.makedirs(map_dir, exist_ok=True)
+    if args.save_npy:
+        os.makedirs(raw_dir, exist_ok=True)
+        os.makedirs(map_dir, exist_ok=True)
     os.makedirs(image_dir, exist_ok=True)
 
     metadata = {
@@ -465,6 +468,7 @@ def _save_component_gradient_exports(
         'input_saliency_method': args.input_saliency_method,
         'noise_iters': args.noise_iters,
         'noise_percent': args.noise_percent,
+        'save_npy': bool(args.save_npy),
         'aggregation': 'max_abs_over_channels',
         'normalization': 'clip_to_p90_p99_then_minmax',
         'normalized_map_overlay_statistics': {},
@@ -473,9 +477,10 @@ def _save_component_gradient_exports(
 
     for component_name, grads in component_gradients.items():
         arrays = _prepare_gradient_arrays(grads)
-        np.save(os.path.join(raw_dir, f'{save_name}_{component_name}_raw_grad.npy'), arrays['raw_grad'])
-        np.save(os.path.join(map_dir, f'{save_name}_{component_name}_abs_map.npy'), arrays['abs_map'])
-        np.save(os.path.join(map_dir, f'{save_name}_{component_name}_normalized_map.npy'), arrays['normalized_map'])
+        if args.save_npy:
+            np.save(os.path.join(raw_dir, f'{save_name}_{component_name}_raw_grad.npy'), arrays['raw_grad'])
+            np.save(os.path.join(map_dir, f'{save_name}_{component_name}_abs_map.npy'), arrays['abs_map'])
+            np.save(os.path.join(map_dir, f'{save_name}_{component_name}_normalized_map.npy'), arrays['normalized_map'])
 
         image_path = os.path.join(image_dir, f'input_saliency_heatmap_{save_name}_{component_name}.png')
         _save_gradient_visualization(
@@ -490,9 +495,18 @@ def _save_component_gradient_exports(
             'loss_value': float(component_losses.get(component_name, float('nan'))),
             'percentile_low': arrays['percentile_low'],
             'percentile_high': arrays['percentile_high'],
-            'raw_gradient_path': os.path.join('raw_gradients', f'{save_name}_{component_name}_raw_grad.npy'),
-            'abs_map_path': os.path.join('maps', f'{save_name}_{component_name}_abs_map.npy'),
-            'normalized_map_path': os.path.join('maps', f'{save_name}_{component_name}_normalized_map.npy'),
+            'raw_gradient_path': (
+                os.path.join('raw_gradients', f'{save_name}_{component_name}_raw_grad.npy')
+                if args.save_npy else None
+            ),
+            'abs_map_path': (
+                os.path.join('maps', f'{save_name}_{component_name}_abs_map.npy')
+                if args.save_npy else None
+            ),
+            'normalized_map_path': (
+                os.path.join('maps', f'{save_name}_{component_name}_normalized_map.npy')
+                if args.save_npy else None
+            ),
             'image_path': os.path.join('images', f'input_saliency_heatmap_{save_name}_{component_name}.png'),
         }
 
@@ -872,9 +886,11 @@ def _save_feature_arrays(
     file_name,
     feature_cache,
     model_input_shape,
+    save_npy,
 ):
     npy_dir = os.path.join(per_image_dir, 'npy')
-    os.makedirs(npy_dir, exist_ok=True)
+    if save_npy:
+        os.makedirs(npy_dir, exist_ok=True)
 
     manifest = {
         'image_id': image_id_key,
@@ -891,14 +907,15 @@ def _save_feature_arrays(
 
         array = tensor.float().numpy()
         file_base = 'feat_{}.npy'.format(logical_name)
-        file_path = os.path.join(npy_dir, file_base)
-        np.save(file_path, array)
+        if save_npy:
+            file_path = os.path.join(npy_dir, file_base)
+            np.save(file_path, array)
 
         manifest['layers'].append(
             {
                 'logical_name': logical_name,
                 'module_name': item['module_name'],
-                'tensor_path': os.path.join('npy', file_base),
+                'tensor_path': os.path.join('npy', file_base) if save_npy else None,
                 'shape': list(array.shape),
                 'dtype': str(array.dtype),
             }
@@ -934,8 +951,12 @@ def _export_intermediate_features(reference_image, net, adapter, args, testset):
         file_name=file_name,
         feature_cache=feature_cache,
         model_input_shape=tuple(reference_image.shape),
+        save_npy=bool(args.save_npy),
     )
-    print(f'Intermediate features saved to {per_image_dir}')
+    if args.save_npy:
+        print(f'Intermediate features saved to {per_image_dir}')
+    else:
+        print(f'Feature manifest saved to {per_image_dir} (set --save_npy to export tensor arrays)')
 
 
 def _export_model_checkpoint(model, args) -> None:
@@ -1320,9 +1341,10 @@ if __name__ == '__main__':
     per_image_dir = _per_image_output_dir(args)
     os.makedirs(per_image_dir, exist_ok=True)
 
-    input_tensor_path = os.path.join(per_image_dir, 'input_tensor.npy')
-    np.save(input_tensor_path, reference_image.cpu().numpy()[0, :3])  # Save the original input tensor (without gradients) for reference
-    print(f'Input tensor saved to {input_tensor_path}')
+    if args.save_npy:
+        input_tensor_path = os.path.join(per_image_dir, 'input_tensor.npy')
+        np.save(input_tensor_path, reference_image.cpu().numpy()[0, :3])  # Save the original input tensor (without gradients) for reference
+        print(f'Input tensor saved to {input_tensor_path}')
 
     detection_overlay = _build_detection_overlay(reference_image, net, args)
     if detection_overlay is not None:
