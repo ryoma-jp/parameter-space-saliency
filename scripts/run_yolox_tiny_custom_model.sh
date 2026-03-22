@@ -9,6 +9,7 @@ DET_FP_LOC_WEIGHT=1.0
 DET_FP_LOC_IOU_THRESHOLD=0.3
 DET_FP_LOC_GATE_SHARPNESS=12.0
 DET_FP_LOC_SCORE_POWER=1.0
+DET_EMPTY_GT_POLICY=fp_loc_only
 
 if [ ! -f "$MODEL_WEIGHTS_PATH" ]; then
     echo "Missing checkpoint: $MODEL_WEIGHTS_PATH"
@@ -35,6 +36,7 @@ for method in auto; do
         -e DET_FP_LOC_IOU_THRESHOLD="$DET_FP_LOC_IOU_THRESHOLD" \
         -e DET_FP_LOC_GATE_SHARPNESS="$DET_FP_LOC_GATE_SHARPNESS" \
         -e DET_FP_LOC_SCORE_POWER="$DET_FP_LOC_SCORE_POWER" \
+        -e DET_EMPTY_GT_POLICY="$DET_EMPTY_GT_POLICY" \
         -e METHOD="$method" \
         pss \
             bash -lc 'set -euo pipefail
@@ -70,6 +72,7 @@ for method in auto; do
                     --det_fp_loc_iou_threshold "$DET_FP_LOC_IOU_THRESHOLD" \
                     --det_fp_loc_gate_sharpness "$DET_FP_LOC_GATE_SHARPNESS" \
                     --det_fp_loc_score_power "$DET_FP_LOC_SCORE_POWER" \
+                    --det_empty_gt_policy "$DET_EMPTY_GT_POLICY" \
                     --input_saliency_method "$METHOD" \
                     --target_type true_label
             done'

@@ -385,6 +385,26 @@ class DetectionTaskAdapter(TaskAdapter):
 
         return torch.stack(per_image_losses).mean()
 
+    @staticmethod
+    def _zero_loss_like(outputs: torch.Tensor) -> torch.Tensor:
+        return outputs.sum() * 0.0
+
+    def _build_empty_gt_components(
+        self,
+        outputs: torch.Tensor,
+        gt_instances: List[Dict[str, torch.Tensor]],
+        context: Dict[str, Any],
+    ) -> Dict[str, torch.Tensor]:
+        zero = self._zero_loss_like(outputs)
+        fp_loc = self._build_fp_loc_objective(outputs, gt_instances, context)
+        return {
+            'obj': zero,
+            'cls': zero,
+            'iou': zero,
+            'fp_loc': fp_loc,
+            'total': fp_loc,
+        }
+
     def _resolve_targets_from_gt(
         self,
         gt_instances: List[Dict[str, torch.Tensor]],
@@ -431,6 +451,16 @@ class DetectionTaskAdapter(TaskAdapter):
             raise ValueError(
                 "det_gt_instances is required for detection objective modes other than 'legacy_single_class'."
             )
+
+        det_has_gt = bool(context.get('det_has_gt', True))
+        if not det_has_gt:
+            outputs = model(inputs)
+            if outputs.ndim != 3 or outputs.size(-1) < 6:
+                raise ValueError(
+                    'DetectionTaskAdapter expects model outputs shaped as (B, N, 5 + C).'
+                )
+            components = self._build_empty_gt_components(outputs, gt_instances, context)
+            return components['total'], self._resolve_targets_from_gt(gt_instances, true_labels)
 
         provider = self._resolve_provider(model, context)
         if provider is None and provider_strict and str(context.get('det_objective_provider', self.objective_provider)) != 'none':
@@ -494,6 +524,15 @@ class DetectionTaskAdapter(TaskAdapter):
             raise ValueError(
                 "det_gt_instances is required for detection objective modes other than 'legacy_single_class'."
             )
+
+        det_has_gt = bool(context.get('det_has_gt', True))
+        if not det_has_gt:
+            outputs = model(inputs)
+            if outputs.ndim != 3 or outputs.size(-1) < 6:
+                raise ValueError(
+                    'DetectionTaskAdapter expects model outputs shaped as (B, N, 5 + C).'
+                )
+            return self._build_empty_gt_components(outputs, gt_instances, context)
 
         provider = self._resolve_provider(model, context)
         if provider is not None:

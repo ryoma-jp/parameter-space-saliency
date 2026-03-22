@@ -130,6 +130,11 @@ parser.add_argument('--det_fp_loc_gate_sharpness', default=12.0, type=float,
                     help='sigmoid sharpness for low-IoU FP gating')
 parser.add_argument('--det_fp_loc_score_power', default=1.0, type=float,
                     help='power applied to prediction score in location-FP term')
+parser.add_argument('--det_empty_gt_policy',
+                    default='error',
+                    choices=['error', 'fp_loc_only'],
+                    help='behavior when selected detection image has no COCO GT: '
+                         'error (raise) or fp_loc_only (use fp_loc as the only active loss)')
 parser.add_argument('--input_saliency_method',
                 default='auto',
                 choices=['auto', 'matching', 'direct_loss'],
@@ -440,6 +445,7 @@ def _save_component_gradient_exports(
     args,
     reference_image,
     inv_transform_test,
+    objective_context=None,
     detection_overlay=None,
 ):
     if not component_gradients:
@@ -460,7 +466,13 @@ def _save_component_gradient_exports(
         'reference_id': args.reference_id,
         'model_class_path': args.model_class_path,
         'objective_provider': args.det_objective_provider,
-        'objective_mode': args.det_objective_mode,
+        'objective_mode': (
+            objective_context.get('det_effective_objective_mode', args.det_objective_mode)
+            if objective_context else args.det_objective_mode
+        ),
+        'objective_mode_requested': args.det_objective_mode,
+        'det_has_gt': (objective_context.get('det_has_gt') if objective_context else None),
+        'det_empty_gt_policy': args.det_empty_gt_policy,
         'det_fp_loc_weight': args.det_fp_loc_weight,
         'det_fp_loc_iou_threshold': args.det_fp_loc_iou_threshold,
         'det_fp_loc_gate_sharpness': args.det_fp_loc_gate_sharpness,
@@ -651,6 +663,20 @@ def _xyxy_to_cxcywh(boxes_xyxy: np.ndarray) -> np.ndarray:
     return out
 
 
+def _make_detection_gt_instance(boxes_xyxy: np.ndarray, class_ids: np.ndarray) -> dict:
+    boxes_xyxy = np.asarray(boxes_xyxy, dtype=np.float32).reshape(-1, 4)
+    class_ids = np.asarray(class_ids, dtype=np.int64).reshape(-1)
+    if boxes_xyxy.shape[0] == 0:
+        boxes_cxcywh = np.zeros((0, 4), dtype=np.float32)
+    else:
+        boxes_cxcywh = _xyxy_to_cxcywh(boxes_xyxy)
+    return {
+        'class_ids': torch.from_numpy(class_ids).to(dtype=torch.long),
+        'boxes_xyxy': torch.from_numpy(boxes_xyxy),
+        'boxes_cxcywh': torch.from_numpy(boxes_cxcywh),
+    }
+
+
 def _build_detection_objective_context(args, reference_image):
     if args.task != 'detection':
         return None
@@ -668,9 +694,12 @@ def _build_detection_objective_context(args, reference_image):
         'det_fp_loc_iou_threshold': args.det_fp_loc_iou_threshold,
         'det_fp_loc_gate_sharpness': args.det_fp_loc_gate_sharpness,
         'det_fp_loc_score_power': args.det_fp_loc_score_power,
+        'det_empty_gt_policy': args.det_empty_gt_policy,
+        'det_effective_objective_mode': args.det_objective_mode,
     }
 
     if args.det_objective_mode == 'legacy_single_class':
+        context['det_has_gt'] = True
         return context
 
     if args.reference_id is not None:
@@ -683,19 +712,32 @@ def _build_detection_objective_context(args, reference_image):
     w = int(reference_image.shape[-1])
     gt_boxes, gt_classes, _ = _load_coco_gt_for_image(args, image_hw=(h, w))
     if len(gt_boxes) == 0:
+        context['det_has_gt'] = False
+        context['det_gt_instances'] = [
+            _make_detection_gt_instance(
+                np.zeros((0, 4), dtype=np.float32),
+                np.zeros((0,), dtype=np.int64),
+            )
+        ]
+        if args.det_empty_gt_policy == 'fp_loc_only':
+            context['det_effective_objective_mode'] = 'fp_loc_only'
+            print(
+                'No COCO GT instances were found for the selected image. '
+                'Using fp_loc-only objective for this empty-image case.'
+            )
+            return context
         raise ValueError(
             'No COCO GT instances were found for the selected image. '
-            'Provide --det_annotations_json and ensure --image_path matches file_name in annotations.'
+            'Provide --det_annotations_json and ensure --image_path matches file_name in annotations, '
+            'or set --det_empty_gt_policy fp_loc_only for empty-image handling.'
         )
 
-    boxes_xyxy = np.array(gt_boxes, dtype=np.float32)
-    boxes_cxcywh = _xyxy_to_cxcywh(boxes_xyxy)
+    context['det_has_gt'] = True
     context['det_gt_instances'] = [
-        {
-            'class_ids': torch.tensor(gt_classes, dtype=torch.long),
-            'boxes_xyxy': torch.from_numpy(boxes_xyxy),
-            'boxes_cxcywh': torch.from_numpy(boxes_cxcywh),
-        }
+        _make_detection_gt_instance(
+            np.array(gt_boxes, dtype=np.float32),
+            np.array(gt_classes, dtype=np.int64),
+        )
     ]
     return context
 
@@ -1368,6 +1410,7 @@ if __name__ == '__main__':
         args,
         reference_image,
         inv_transform_test,
+        objective_context=objective_context,
         detection_overlay=detection_overlay,
     )
 
