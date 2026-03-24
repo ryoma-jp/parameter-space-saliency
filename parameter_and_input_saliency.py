@@ -793,7 +793,7 @@ def _build_detection_overlay(reference_image, net, args):
     if len(gt_boxes) == 0:
         # GT が無い場合は全予測をFPとして描画して注意喚起する。
         fp_loc_boxes = [
-            {'box': boxes_xyxy[i].tolist(), 'cls_id': int(cls_ids[i])}
+            {'box': boxes_xyxy[i].tolist(), 'cls_id': int(cls_ids[i]), 'score': float(scores[i])}
             for i in range(boxes_xyxy.shape[0])
         ]
         return {
@@ -814,7 +814,7 @@ def _build_detection_overlay(reference_image, net, args):
         for g in range(len(gt_boxes))
     ]
     pred_overlay_boxes = [
-        {'box': boxes_xyxy[p].tolist(), 'cls_id': int(cls_ids[p])}
+        {'box': boxes_xyxy[p].tolist(), 'cls_id': int(cls_ids[p]), 'score': float(scores[p])}
         for p in range(boxes_xyxy.shape[0])
     ]
 
@@ -828,6 +828,7 @@ def _build_detection_overlay(reference_image, net, args):
     for pidx in pred_order:
         pbox = boxes_xyxy[pidx]
         pcls = cls_ids[pidx]
+        pscore = float(scores[pidx])
 
         # 1) Try regular TP matching first (same class + IoU threshold).
         candidate_same_cls = np.where((gt_classes == pcls) & (~matched_gt))[0]
@@ -839,7 +840,7 @@ def _build_detection_overlay(reference_image, net, args):
 
             if best_same_iou >= iou_thr:
                 matched_gt[best_same_gt] = True
-                tp_boxes.append({'box': pbox.tolist(), 'cls_id': int(pcls)})
+                tp_boxes.append({'box': pbox.tolist(), 'cls_id': int(pcls), 'score': pscore})
                 continue
 
         # 2) If localization overlaps a GT but class is wrong, mark as FP(class).
@@ -850,17 +851,20 @@ def _build_detection_overlay(reference_image, net, args):
             best_any_iou = float(ious_any[best_any_local])
             best_any_gt = int(candidate_any_cls[best_any_local])
             if best_any_iou >= iou_thr and int(gt_classes[best_any_gt]) != int(pcls):
-                fp_cls_boxes.append({'box': pbox.tolist(), 'cls_id': int(pcls)})
+                fp_cls_boxes.append({
+                    'box': pbox.tolist(), 'cls_id': int(pcls), 'score': pscore,
+                    'matched_gt_cls_id': int(gt_classes[best_any_gt]),
+                })
                 continue
 
         # 3) Otherwise, treat as FP(location): no sufficient overlap with any GT.
-        fp_loc_boxes.append({'box': pbox.tolist(), 'cls_id': int(pcls)})
+        fp_loc_boxes.append({'box': pbox.tolist(), 'cls_id': int(pcls), 'score': pscore})
 
     fn_indices = np.where(~matched_gt)[0]
     fn_boxes = [
         {'box': gt_boxes[g].tolist(), 'cls_id': int(gt_classes[g])}
         for g in fn_indices
-    ]
+    ]  # FN にはスコアなし（検出されていないため）
     return {
         'tp': tp_boxes,
         'fp': fp_cls_boxes + fp_loc_boxes,
@@ -871,6 +875,132 @@ def _build_detection_overlay(reference_image, net, args):
         'pred': pred_overlay_boxes,
         'class_names': class_names,
     }
+
+
+# ---------------------------------------------------------------------------
+# Detection overlay catalog (per-image JSON with dual-space box coordinates)
+# ---------------------------------------------------------------------------
+
+def _get_original_hw_for_image(args):
+    """Return (H, W) of the source image in original resolution.
+
+    Tries COCO annotations first (fast, no pixel decode), then falls back to
+    opening the image file with PIL (reads only the header for JPEG/PNG).
+    Returns None when the size cannot be determined.
+    """
+    ann_path = _resolve_detection_annotations_path(args)
+    if ann_path and args.image_path and os.path.isfile(ann_path):
+        try:
+            with open(ann_path, 'r') as f:
+                coco_data = json.load(f)
+            basename = os.path.basename(args.image_path)
+            for img_info in coco_data.get('images', []):
+                if img_info.get('file_name') == basename:
+                    return int(img_info['height']), int(img_info['width'])
+        except Exception:
+            pass
+    if args.image_path and os.path.isfile(args.image_path):
+        from PIL import Image as _PilImg
+        with _PilImg.open(args.image_path) as pil_img:
+            w, h = pil_img.size
+        return h, w
+    return None
+
+
+def _save_detection_overlay_catalog(detection_overlay, reference_image, args):
+    """Save detection overlay with dual-space box coordinates as JSON.
+
+    Output file: <per_image_dir>/detection_overlay_catalog.json
+
+    Box coordinate spaces:
+        box_input  – model-input space [x1,y1,x2,y2] (e.g. 416x416 letterbox).
+                     Coordinates produced directly by the model and NMS.
+        box_orig   – original-image space [x1,y1,x2,y2] (raw JPEG resolution).
+                     Derived from box_input via the inverse of the preprocessing
+                     transform.  Use these to crop the original image for
+                     image-feature computation.
+
+    Letterbox inverse transform (dx=dy=0 because padding is top-left aligned):
+        x_orig = x_input / letterbox_scale
+        y_orig = y_input / letterbox_scale
+    """
+    if detection_overlay is None or args.reference_id is not None:
+        return
+
+    original_hw = _get_original_hw_for_image(args)
+    if original_hw is None:
+        print('Detection overlay catalog: cannot determine original image size; skipping.')
+        return
+
+    h_in = int(reference_image.shape[-2])
+    w_in = int(reference_image.shape[-1])
+    orig_h, orig_w = original_hw
+
+    preprocess_cfg = _get_preprocess_cfg(args)
+    use_letterbox = bool(preprocess_cfg.get('letterbox', False))
+
+    if use_letterbox:
+        # Padding is placed at bottom-right (_LetterboxTransform pads at [0:new_h, 0:new_w]),
+        # so there is no centering offset: dx = dy = 0.
+        r = min(float(h_in) / float(orig_h), float(w_in) / float(orig_w))
+        letterbox_scale = float(r)
+        letterbox_dx = 0.0
+        letterbox_dy = 0.0
+        r_inv = 1.0 / r
+
+        def _to_orig(box):
+            return [box[0] * r_inv, box[1] * r_inv, box[2] * r_inv, box[3] * r_inv]
+    else:
+        sx = float(orig_w) / float(w_in)
+        sy = float(orig_h) / float(h_in)
+        letterbox_scale = None
+        letterbox_dx = 0.0
+        letterbox_dy = 0.0
+
+        def _to_orig(box):
+            return [box[0] * sx, box[1] * sy, box[2] * sx, box[3] * sy]
+
+    def _convert_items(items, has_score=True, has_matched_gt_cls=False):
+        out = []
+        for item in items:
+            box = item['box']
+            entry = {
+                'box_input': [round(float(v), 3) for v in box],
+                'box_orig': [round(float(v), 3) for v in _to_orig(box)],
+                'cls_id': int(item['cls_id']),
+            }
+            if has_score:
+                raw_score = item.get('score')
+                entry['score'] = float(raw_score) if raw_score is not None else None
+            if has_matched_gt_cls and 'matched_gt_cls_id' in item:
+                entry['matched_gt_cls_id'] = int(item['matched_gt_cls_id'])
+            out.append(entry)
+        return out
+
+    # JSON requires string keys; class_names may have int keys from Python dict.
+    class_names_str = {str(k): v for k, v in detection_overlay.get('class_names', {}).items()}
+
+    catalog = {
+        'image_id': _reference_output_key(args),
+        'file_name': os.path.basename(args.image_path),
+        'model_input_hw': [h_in, w_in],
+        'original_hw': [int(orig_h), int(orig_w)],
+        'letterbox_scale': letterbox_scale,
+        'letterbox_dx': letterbox_dx,
+        'letterbox_dy': letterbox_dy,
+        'class_names': class_names_str,
+        'tp':     _convert_items(detection_overlay.get('tp', []),     has_score=True),
+        'fp_cls': _convert_items(detection_overlay.get('fp_cls', []), has_score=True, has_matched_gt_cls=True),
+        'fp_loc': _convert_items(detection_overlay.get('fp_loc', []), has_score=True),
+        'fn':     _convert_items(detection_overlay.get('fn', []),     has_score=False),
+        'gt':     _convert_items(detection_overlay.get('gt', []),     has_score=False),
+    }
+
+    per_image_dir = _per_image_output_dir(args)
+    os.makedirs(per_image_dir, exist_ok=True)
+    catalog_path = os.path.join(per_image_dir, 'detection_overlay_catalog.json')
+    with open(catalog_path, 'w', encoding='utf-8') as f:
+        json.dump(catalog, f, ensure_ascii=False, indent=2)
 
 
 def _reference_output_key(args) -> str:
@@ -1396,6 +1526,7 @@ if __name__ == '__main__':
             detection_overlay,
             per_image_dir,
         )
+        _save_detection_overlay_catalog(detection_overlay, reference_image, args)
     _export_intermediate_features(reference_image, net, adapter, args, testset)
     save_gradients(
         grads_to_save,
