@@ -87,18 +87,43 @@ plt.show()
 """))
 
 # ---------------------------------------------------------------------------
-# 2. Class TP/FP/FN
+# 2. Class TP/FP/FN count + rate
 cells.append(nbf.v4.new_markdown_cell("## 2. クラス別 TP / FP / FN（上位20クラス）"))
 cells.append(nbf.v4.new_code_cell("""\
-top20 = cm_df.nlargest(20, "total")
-fig, ax = plt.subplots(figsize=(12, 6))
+top20 = cm_df.nlargest(20, "total").copy()
+top20["tp_rate"] = top20["tp"] / top20["total"]
+top20["fp_rate"] = top20["fp"] / top20["total"]
+top20["fn_rate"] = top20["fn"] / top20["total"]
+
+fig, axes = plt.subplots(2, 1, figsize=(13, 10))
 x = np.arange(len(top20)); w = 0.28
-ax.bar(x - w, top20["tp"], width=w, label="TP", color="#59a14f")
-ax.bar(x,     top20["fp"], width=w, label="FP", color="#e15759")
-ax.bar(x + w, top20["fn"], width=w, label="FN", color="#f28e2b")
-ax.set_xticks(x)
-ax.set_xticklabels(top20["class_name"], rotation=45, ha="right")
-ax.set_ylabel("Count"); ax.set_title("Class-wise TP / FP / FN (top 20 by total)"); ax.legend()
+
+# --- 上段: 件数 ---
+axes[0].bar(x - w, top20["tp"], width=w, label="TP", color="#59a14f")
+axes[0].bar(x,     top20["fp"], width=w, label="FP", color="#e15759")
+axes[0].bar(x + w, top20["fn"], width=w, label="FN", color="#f28e2b")
+axes[0].set_xticks(x)
+axes[0].set_xticklabels(top20["class_name"], rotation=45, ha="right")
+axes[0].set_ylabel("Count")
+axes[0].set_title("Class-wise TP / FP / FN — Count (top 20 by total)")
+axes[0].legend()
+
+# --- 下段: 率（積み上げ横棒） ---
+axes[1].bar(x, top20["tp_rate"], width=0.6, label="TP rate", color="#59a14f")
+axes[1].bar(x, top20["fp_rate"], width=0.6, label="FP rate", color="#e15759",
+            bottom=top20["tp_rate"].values)
+axes[1].bar(x, top20["fn_rate"], width=0.6, label="FN rate", color="#f28e2b",
+            bottom=(top20["tp_rate"] + top20["fp_rate"]).values)
+axes[1].set_xticks(x)
+axes[1].set_xticklabels(top20["class_name"], rotation=45, ha="right")
+axes[1].set_ylim(0, 1); axes[1].set_ylabel("Rate")
+axes[1].set_title("Class-wise TP / FP / FN — Rate (top 20 by total)")
+axes[1].legend(loc="upper right")
+# 各バーの上にTP率をテキスト表示
+for i, row in top20.reset_index(drop=True).iterrows():
+    axes[1].text(i, row["tp_rate"] / 2, f"{row['tp_rate']:.0%}",
+                 ha="center", va="center", fontsize=7, color="white", fontweight="bold")
+
 plt.tight_layout(); plt.savefig(FIG_DIR / "02_class_tp_fp_fn.png"); plt.show()
 """))
 
@@ -198,7 +223,7 @@ plt.tight_layout(); plt.savefig(FIG_DIR / "07_center_heatmap.png", bbox_inches="
 """))
 
 # ---------------------------------------------------------------------------
-# 8. Feature means
+# 8. Feature means + correct rate per feature bin
 cells.append(nbf.v4.new_markdown_cell("## 8. 画像特徴量: 正解 vs 不正解 の平均比較"))
 cells.append(nbf.v4.new_code_cell("""\
 pivot = feat_df.pivot_table(index="feature", columns="is_correct", values="mean")
@@ -213,6 +238,53 @@ ax.set_yticks(x); ax.set_yticklabels(pivot.index)
 ax.set_xlabel("Mean Value"); ax.set_title("Image Feature Means: Correct vs Incorrect"); ax.legend()
 plt.tight_layout(); plt.savefig(FIG_DIR / "08_feature_means.png"); plt.show()
 print(pivot[["Correct (TP)", "Incorrect (FP+FN)", "diff"]].to_string())
+"""))
+
+# 8b. Correct rate per feature quantile bin
+cells.append(nbf.v4.new_markdown_cell(
+    "### 8b. 各画像特徴量の値域別 正解率\n"
+    "各特徴量を10分位に区切り、区間ごとの正解率（TP / (TP+FP+FN)）をプロットする。"
+))
+cells.append(nbf.v4.new_code_cell("""\
+FEATURE_COLS = [
+    "luminance_mean", "luminance_std", "rms_contrast",
+    "saturation_mean", "colorfulness", "sharpness_laplacian",
+    "edge_density", "noise_sigma", "total_variation",
+]
+N_BINS = 10
+ncols = 3; nrows = (len(FEATURE_COLS) + ncols - 1) // ncols
+fig, axes = plt.subplots(nrows, ncols, figsize=(15, nrows * 3.5))
+axes = axes.flatten()
+
+for ax, col in zip(axes, FEATURE_COLS):
+    tmp = df[[col, "is_correct"]].dropna(subset=[col])
+    tmp["bin"] = pd.qcut(tmp[col], q=N_BINS, duplicates="drop")
+    grp = tmp.groupby("bin", observed=False)
+    correct_rate = grp["is_correct"].mean()
+    counts       = grp["is_correct"].count()
+    bin_labels   = [f"{iv.mid:.2g}" for iv in correct_rate.index]
+
+    bars = ax.bar(range(len(correct_rate)), correct_rate.values,
+                  color=["#59a14f" if v >= 0.5 else "#e15759" for v in correct_rate.values],
+                  alpha=0.85)
+    ax2 = ax.twinx()
+    ax2.plot(range(len(counts)), counts.values, color="gray", linewidth=1,
+             linestyle="--", marker="o", markersize=3, alpha=0.6)
+    ax2.set_ylabel("Count", fontsize=7, color="gray")
+    ax2.tick_params(axis="y", labelsize=6, labelcolor="gray")
+
+    ax.set_xticks(range(len(bin_labels)))
+    ax.set_xticklabels(bin_labels, rotation=60, ha="right", fontsize=6)
+    ax.set_ylim(0, 1)
+    ax.axhline(0.5, color="gray", linewidth=0.7, linestyle=":")
+    ax.set_title(col, fontsize=9)
+    ax.set_ylabel("Correct Rate", fontsize=7)
+
+for ax in axes[len(FEATURE_COLS):]:
+    ax.set_visible(False)
+
+plt.suptitle("Correct Rate by Feature Value Bin (10-quantile)", y=1.01)
+plt.tight_layout(); plt.savefig(FIG_DIR / "08b_feature_correct_rate.png", bbox_inches="tight"); plt.show()
 """))
 
 # ---------------------------------------------------------------------------
@@ -240,30 +312,96 @@ plt.tight_layout(); plt.savefig(FIG_DIR / "09_feature_kde.png", bbox_inches="tig
 """))
 
 # ---------------------------------------------------------------------------
-# 10. Class x Size heatmap
-cells.append(nbf.v4.new_markdown_cell("## 10. クラス × サイズ帯 正解率ヒートマップ（上位15クラス）"))
+# 10. Class x Size heatmap: color=count proportion, annot=correct rate
+cells.append(nbf.v4.new_markdown_cell(
+    "## 10. クラス × サイズ帯 正解率ヒートマップ（上位15クラス）\n\n"
+    "- **数値**: 正解率（TP / (TP+FP+FN)）\n"
+    "- **色**: そのクラス内でのサイズ帯の物体数割合（濃い = 物体が多い）"
+))
 cells.append(nbf.v4.new_code_cell("""\
 top15_cls = cm_df.nlargest(15, "total")["class_name"].tolist()
 sub = df[df["class_name"].isin(top15_cls)].copy()
 
-heatmap_data = (
+correct_rate_data = (
     sub.groupby(["class_name", "size_band"], observed=False)["is_correct"]
     .mean().unstack("size_band")
 )
 count_data = (
     sub.groupby(["class_name", "size_band"], observed=False)
     .size().unstack("size_band")
-)
-mask = count_data < 5
+).fillna(0)
 
-fig, ax = plt.subplots(figsize=(8, 7))
+# 各クラス内でのサイズ帯の物体数割合（行方向で正規化）
+row_sum = count_data.sum(axis=1).replace(0, np.nan)
+count_ratio = count_data.div(row_sum, axis=0)  # 色に使う
+
+# アノテーション: 正解率（件数が5未満はハイフン）
+anno = correct_rate_data.copy().astype(object)
+for cls in anno.index:
+    for band in anno.columns:
+        n = count_data.loc[cls, band]
+        r = correct_rate_data.loc[cls, band]
+        anno.loc[cls, band] = f"{r:.2f}" if n >= 5 else "-"
+
+fig, ax = plt.subplots(figsize=(9, 8))
 sns.heatmap(
-    heatmap_data, mask=mask, annot=True, fmt=".2f",
-    cmap="RdYlGn", vmin=0, vmax=1, linewidths=0.5, ax=ax
+    count_ratio,
+    annot=anno, fmt="",
+    cmap="Blues", vmin=0, vmax=1,
+    linewidths=0.5, ax=ax,
+    cbar_kws={"label": "Size band proportion within class"}
 )
-ax.set_title("Correct Rate: Class x Size Band (top 15, n>=5)")
+ax.set_title("Class x Size Band  (color=count proportion, number=correct rate, '-'=n<5)")
 ax.set_xlabel("Size Band"); ax.set_ylabel("Class")
 plt.tight_layout(); plt.savefig(FIG_DIR / "10_class_size_heatmap.png"); plt.show()
+"""))
+
+# 10b. 一覧表
+cells.append(nbf.v4.new_markdown_cell("### 10b. クラス × サイズ帯 一覧表"))
+cells.append(nbf.v4.new_code_cell("""\
+# 正解率 + 件数を合わせた一覧表を構築
+rows = []
+for cls in top15_cls:
+    for band in ["xs", "s", "m", "l"]:
+        g = sub[(sub["class_name"] == cls) & (sub["size_band"] == band)]
+        n = len(g)
+        tp_ = int(g["is_correct"].sum())
+        fp_ = int(g["is_fp"].sum())
+        fn_ = int(g["is_fn"].sum())
+        rate = tp_ / n if n > 0 else float("nan")
+        rows.append(dict(
+            class_name=cls, size_band=band,
+            total=n, tp=tp_, fp=fp_, fn=fn_,
+            correct_rate=round(rate, 3) if n > 0 else float("nan"),
+        ))
+
+table_df = pd.DataFrame(rows)
+table_df["size_band"] = pd.Categorical(table_df["size_band"], categories=["xs","s","m","l"], ordered=True)
+table_df = table_df.sort_values(["class_name", "size_band"]).reset_index(drop=True)
+
+# ピボット表示（class x size_band, 各セルに 'TP率 (n=件数)' を表示）
+pivot_disp = table_df.pivot_table(
+    index="class_name", columns="size_band",
+    values=["correct_rate", "total"], aggfunc="first"
+)
+# 見やすいテキスト形式に変換
+result_rows = []
+for cls in table_df["class_name"].unique():
+    row = {"class_name": cls}
+    for band in ["xs", "s", "m", "l"]:
+        sub_row = table_df[(table_df["class_name"]==cls) & (table_df["size_band"]==band)]
+        if len(sub_row) == 0 or sub_row["total"].values[0] == 0:
+            row[band] = "-"
+        else:
+            r = sub_row["correct_rate"].values[0]
+            n = sub_row["total"].values[0]
+            tp_n = sub_row["tp"].values[0]
+            row[band] = f"{r:.2f} (n={n}, TP={tp_n})"
+    result_rows.append(row)
+
+disp_df = pd.DataFrame(result_rows).set_index("class_name")
+print(disp_df.to_string())
+disp_df
 """))
 
 nb.cells = cells
