@@ -7,6 +7,7 @@ Conventional saliency maps highlight input features to which neural network pred
 Getting started
 ---------------
 ```
+$ ./scripts/make_env.sh
 $ docker-compose build
 $ docker-compose up -d
 $ docker-compose exec pss bash

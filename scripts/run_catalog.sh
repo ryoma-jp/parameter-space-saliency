@@ -19,7 +19,6 @@ SKIP_CATALOG=${SKIP_CATALOG:-0}
 
 DOCKER_COMMON_OPTS=(
     --rm
-    -u "$(id -u):$(id -g)"
     -e HOME=/work
     -e XDG_CACHE_HOME=/work/.cache
     -e PYTHONPATH=/work/externals/YOLOX:/work

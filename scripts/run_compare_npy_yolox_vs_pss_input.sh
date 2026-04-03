@@ -4,7 +4,7 @@ OUTPUT_DIR=results/compare_npy_yolox_vs_pss/input_tensor
 rm -rf "$OUTPUT_DIR"
 mkdir -p "$OUTPUT_DIR"
 
-docker compose run --rm -u $(id -u):$(id -g) \
+docker compose run --rm \
     -e HOME=/work \
     -e XDG_CACHE_HOME=/work/.cache \
     pss \

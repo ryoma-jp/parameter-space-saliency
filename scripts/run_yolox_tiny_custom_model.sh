@@ -23,7 +23,7 @@ for method in auto; do
     echo "Running input saliency with method=${method}, det_fp_loc_weight=${DET_FP_LOC_WEIGHT}"
     rm -rf "$OUTPUT_ROOT"
 
-    docker compose run --rm -u $(id -u):$(id -g) \
+    docker compose run --rm \
         -e HOME=/work \
         -e XDG_CACHE_HOME=/work/.cache \
         -e TORCH_HOME=/work/.cache/torch \

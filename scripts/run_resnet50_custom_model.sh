@@ -10,7 +10,7 @@ if [ ! -f "$MODEL_WEIGHTS_PATH" ]; then
 fi
 
 rm -rf "$OUTPUT_ROOT"
-docker compose run --rm -u $(id -u):$(id -g) \
+docker compose run --rm \
     -e HOME=/work \
     -e XDG_CACHE_HOME=/work/.cache \
     -e TORCH_HOME=/work/.cache/torch \
