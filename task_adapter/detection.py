@@ -140,6 +140,194 @@ class DetectionTaskAdapter(TaskAdapter):
             YOLOXOfficialLossProvider.name: YOLOXOfficialLossProvider(),
         }
 
+    def _classify_instances(
+        self,
+        pred_boxes: torch.Tensor,
+        pred_cls_ids: torch.Tensor,
+        pred_best_scores: torch.Tensor,
+        gt_boxes: torch.Tensor,
+        gt_classes: torch.Tensor,
+        iou_threshold: float,
+    ) -> Dict[str, Any]:
+        """Split predictions into TP / FP-B / FP-A and derive FN indices.
+
+        Matching is greedy by prediction confidence and mirrors the overlay policy.
+        This routine is intentionally non-differentiable and only defines index sets.
+        """
+        num_preds = int(pred_boxes.size(0))
+        num_gt = int(gt_boxes.size(0))
+
+        if num_gt == 0:
+            return {
+                'tp_pairs': [],
+                'fp_cls_pairs': [],
+                'fp_loc_pred_indices': list(range(num_preds)),
+                'fn_gt_indices': [],
+            }
+
+        order = torch.argsort(pred_best_scores.detach(), descending=True)
+        matched_gt = torch.zeros((num_gt,), dtype=torch.bool, device=gt_boxes.device)
+
+        tp_pairs: List[Tuple[int, int]] = []
+        fp_cls_pairs: List[Tuple[int, int]] = []
+        fp_loc_pred_indices: List[int] = []
+
+        for pidx_t in order:
+            pidx = int(pidx_t.item())
+            pbox = pred_boxes[pidx]
+            pcls = int(pred_cls_ids[pidx].item())
+
+            unmatched = torch.nonzero(~matched_gt, as_tuple=False).squeeze(1)
+            if unmatched.numel() == 0:
+                fp_loc_pred_indices.append(pidx)
+                continue
+
+            same_cls = unmatched[gt_classes[unmatched] == pcls]
+            if same_cls.numel() > 0:
+                ious_same = torch.stack(
+                    [self._box_iou_xyxy_vec(pbox.unsqueeze(0), gt_boxes[g]).squeeze(0) for g in same_cls],
+                    dim=0,
+                )
+                best_local = int(torch.argmax(ious_same).item())
+                best_iou = float(ious_same[best_local].item())
+                best_gt = int(same_cls[best_local].item())
+                if best_iou >= iou_threshold:
+                    matched_gt[best_gt] = True
+                    tp_pairs.append((pidx, best_gt))
+                    continue
+
+            ious_any = torch.stack(
+                [self._box_iou_xyxy_vec(pbox.unsqueeze(0), gt_boxes[g]).squeeze(0) for g in unmatched],
+                dim=0,
+            )
+            best_any_local = int(torch.argmax(ious_any).item())
+            best_any_iou = float(ious_any[best_any_local].item())
+            best_any_gt = int(unmatched[best_any_local].item())
+
+            if best_any_iou >= iou_threshold and int(gt_classes[best_any_gt].item()) != pcls:
+                fp_cls_pairs.append((pidx, best_any_gt))
+            else:
+                fp_loc_pred_indices.append(pidx)
+
+        fn_gt_indices = torch.nonzero(~matched_gt, as_tuple=False).squeeze(1).tolist()
+        return {
+            'tp_pairs': tp_pairs,
+            'fp_cls_pairs': fp_cls_pairs,
+            'fp_loc_pred_indices': fp_loc_pred_indices,
+            'fn_gt_indices': fn_gt_indices,
+        }
+
+    def _build_hotness_unified_components(
+        self,
+        outputs: torch.Tensor,
+        gt_instances: List[Dict[str, torch.Tensor]],
+        context: Dict[str, Any],
+    ) -> Dict[str, torch.Tensor]:
+        eps = 1e-8
+        match_iou = float(context.get('det_match_iou_threshold', 0.5))
+        fp_loc_score_power = float(context.get('det_fp_loc_score_power', 1.0))
+        fp_cls_margin = float(context.get('det_fp_cls_margin', 0.1))
+
+        w_tp = float(context.get('det_hotness_weight_tp', 0.0))
+        w_fn = float(context.get('det_hotness_weight_fn', 1.0))
+        w_fp_a = float(context.get('det_hotness_weight_fp_a', 1.0))
+        w_fp_b = float(context.get('det_hotness_weight_fp_b', 1.0))
+        gate_alpha = float(context.get('det_hotness_gate_alpha', 1.0))
+
+        obj = outputs[:, :, 4:5]
+        cls = outputs[:, :, 5:]
+        pred_scores = obj * cls
+        pred_best_scores, pred_best_cls_ids = pred_scores.max(dim=2)
+        pred_boxes = self._cxcywh_to_xyxy(outputs[:, :, :4])
+
+        tp_per_image: List[torch.Tensor] = []
+        fn_per_image: List[torch.Tensor] = []
+        fp_a_per_image: List[torch.Tensor] = []
+        fp_b_per_image: List[torch.Tensor] = []
+
+        for bidx in range(outputs.size(0)):
+            gt_item = gt_instances[bidx]
+            gt_classes = gt_item['class_ids'].to(device=outputs.device, dtype=torch.long)
+            gt_boxes = gt_item['boxes_xyxy'].to(device=outputs.device, dtype=outputs.dtype)
+
+            class_split = self._classify_instances(
+                pred_boxes[bidx],
+                pred_best_cls_ids[bidx],
+                pred_best_scores[bidx],
+                gt_boxes,
+                gt_classes,
+                iou_threshold=match_iou,
+            )
+
+            tp_losses = []
+            for pidx, gt_idx in class_split['tp_pairs']:
+                cls_id = int(gt_classes[gt_idx].item())
+                s_gt = pred_scores[bidx, pidx, cls_id].clamp_min(eps)
+                tp_losses.append(-torch.log(s_gt))
+            tp_loss = torch.stack(tp_losses).mean() if tp_losses else self._zero_loss_like(outputs)
+
+            fn_losses = []
+            for gt_idx in class_split['fn_gt_indices']:
+                cls_id = int(gt_classes[gt_idx].item())
+                cls_scores = pred_scores[bidx, :, cls_id].clamp_min(eps)
+                ious = self._box_iou_xyxy_vec(pred_boxes[bidx], gt_boxes[gt_idx])
+                logits = 3.0 * ious + 1.0 * torch.log(cls_scores)
+                weights = torch.softmax(logits, dim=0)
+                covered_score = torch.sum(weights * cls_scores)
+                fn_losses.append(-torch.log(covered_score.clamp_min(eps)))
+            fn_loss = torch.stack(fn_losses).mean() if fn_losses else self._zero_loss_like(outputs)
+
+            fp_a_losses = []
+            for pidx in class_split['fp_loc_pred_indices']:
+                fp_a_losses.append(torch.pow(pred_best_scores[bidx, pidx].clamp_min(eps), fp_loc_score_power))
+            fp_a_loss = torch.stack(fp_a_losses).mean() if fp_a_losses else self._zero_loss_like(outputs)
+
+            fp_b_losses = []
+            for pidx, gt_idx in class_split['fp_cls_pairs']:
+                gt_cls_id = int(gt_classes[gt_idx].item())
+                gt_score = pred_scores[bidx, pidx, gt_cls_id]
+                cls_row = pred_scores[bidx, pidx]
+                wrong_mask = torch.ones_like(cls_row, dtype=torch.bool)
+                wrong_mask[gt_cls_id] = False
+                if wrong_mask.any():
+                    wrong_score = cls_row[wrong_mask].max()
+                    fp_b_losses.append(torch.clamp(wrong_score - gt_score + fp_cls_margin, min=0.0))
+            fp_b_loss = torch.stack(fp_b_losses).mean() if fp_b_losses else self._zero_loss_like(outputs)
+
+            tp_per_image.append(tp_loss)
+            fn_per_image.append(fn_loss)
+            fp_a_per_image.append(fp_a_loss)
+            fp_b_per_image.append(fp_b_loss)
+
+        tp = torch.stack(tp_per_image).mean()
+        fn = torch.stack(fn_per_image).mean()
+        fp_a = torch.stack(fp_a_per_image).mean()
+        fp_b = torch.stack(fp_b_per_image).mean()
+
+        gated_tp = torch.pow(tp.clamp_min(eps), gate_alpha)
+        gated_fn = torch.pow(fn.clamp_min(eps), gate_alpha)
+        gated_fp_a = torch.pow(fp_a.clamp_min(eps), gate_alpha)
+        gated_fp_b = torch.pow(fp_b.clamp_min(eps), gate_alpha)
+
+        total = (
+            w_tp * gated_tp
+            + w_fn * gated_fn
+            + w_fp_a * gated_fp_a
+            + w_fp_b * gated_fp_b
+        )
+
+        return {
+            'tp': tp,
+            'fn': fn,
+            'fp_a': fp_a,
+            'fp_b': fp_b,
+            'tp_gated': gated_tp,
+            'fn_gated': gated_fn,
+            'fp_a_gated': gated_fp_a,
+            'fp_b_gated': gated_fp_b,
+            'total': total,
+        }
+
     def _resolve_target_classes(
         self,
         outputs: torch.Tensor,
@@ -452,6 +640,15 @@ class DetectionTaskAdapter(TaskAdapter):
                 "det_gt_instances is required for detection objective modes other than 'legacy_single_class'."
             )
 
+        if objective_mode == 'hotness_unified':
+            outputs = model(inputs)
+            if outputs.ndim != 3 or outputs.size(-1) < 6:
+                raise ValueError(
+                    'DetectionTaskAdapter expects model outputs shaped as (B, N, 5 + C).'
+                )
+            components = self._build_hotness_unified_components(outputs, gt_instances, context)
+            return components['total'], self._resolve_targets_from_gt(gt_instances, true_labels)
+
         det_has_gt = bool(context.get('det_has_gt', True))
         if not det_has_gt:
             outputs = model(inputs)
@@ -491,7 +688,7 @@ class DetectionTaskAdapter(TaskAdapter):
         else:
             raise ValueError(
                 f"Unknown detection objective mode: '{objective_mode}'. "
-                "Choose 'gt_all_instances', 'gt_all_classes', or 'legacy_single_class'."
+                "Choose 'gt_all_instances', 'gt_all_classes', 'hotness_unified', or 'legacy_single_class'."
             )
         if fp_loc_weight > 0.0:
             loss = loss + fp_loc_weight * self._build_fp_loc_objective(outputs, gt_instances, context)
@@ -532,7 +729,17 @@ class DetectionTaskAdapter(TaskAdapter):
                 raise ValueError(
                     'DetectionTaskAdapter expects model outputs shaped as (B, N, 5 + C).'
                 )
+            if objective_mode == 'hotness_unified':
+                return self._build_hotness_unified_components(outputs, gt_instances, context)
             return self._build_empty_gt_components(outputs, gt_instances, context)
+
+        if objective_mode == 'hotness_unified':
+            outputs = model(inputs)
+            if outputs.ndim != 3 or outputs.size(-1) < 6:
+                raise ValueError(
+                    'DetectionTaskAdapter expects model outputs shaped as (B, N, 5 + C).'
+                )
+            return self._build_hotness_unified_components(outputs, gt_instances, context)
 
         provider = self._resolve_provider(model, context)
         if provider is not None:

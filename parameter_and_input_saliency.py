@@ -110,7 +110,7 @@ parser.add_argument('--det_match_iou_threshold', default=0.5, type=float,
                     help='IoU threshold for TP/FP matching against GT')
 parser.add_argument('--det_objective_mode',
                     default='gt_all_instances',
-                    choices=['gt_all_instances', 'gt_all_classes', 'legacy_single_class'],
+                    choices=['gt_all_instances', 'gt_all_classes', 'hotness_unified', 'legacy_single_class'],
                     help='objective mode for detection saliency loss')
 parser.add_argument('--det_objective_provider',
                     default='auto',
@@ -130,6 +130,20 @@ parser.add_argument('--det_fp_loc_gate_sharpness', default=12.0, type=float,
                     help='sigmoid sharpness for low-IoU FP gating')
 parser.add_argument('--det_fp_loc_score_power', default=1.0, type=float,
                     help='power applied to prediction score in location-FP term')
+parser.add_argument('--det_fp_cls_margin', default=0.1, type=float,
+                    help='margin used by class-confusion FP objective (fp_b)')
+parser.add_argument('--det_hotness_weight_tp', default=0.0, type=float,
+                    help='weight of TP term in unified hotness objective')
+parser.add_argument('--det_hotness_weight_fn', default=1.0, type=float,
+                    help='weight of FN term in unified hotness objective')
+parser.add_argument('--det_hotness_weight_fp_a', default=1.0, type=float,
+                    help='weight of FP-A term (wrong location) in unified hotness objective')
+parser.add_argument('--det_hotness_weight_fp_b', default=1.0, type=float,
+                    help='weight of FP-B term (class confusion) in unified hotness objective')
+parser.add_argument('--det_hotness_gate_alpha', default=1.0, type=float,
+                    help='alpha of power-gating g(L)=L^alpha in unified hotness objective')
+parser.add_argument('--det_hotness_lambda', default=0.6, type=float,
+                help='blend ratio between normalized gradient map and spatial prior map')
 parser.add_argument('--det_empty_gt_policy',
                     default='error',
                     choices=['error', 'fp_loc_only'],
@@ -205,7 +219,20 @@ def _reference_save_name(args) -> str:
     return save_name
 
 
-def _prepare_gradient_arrays(grads: torch.Tensor) -> dict:
+def _normalize_01(arr: np.ndarray) -> np.ndarray:
+    arr_min = float(np.min(arr))
+    arr_max = float(np.max(arr))
+    denom = arr_max - arr_min
+    if denom <= 1e-12:
+        return np.zeros_like(arr)
+    return (arr - arr_min) / denom
+
+
+def _prepare_gradient_arrays(
+    grads: torch.Tensor,
+    prior_map: np.ndarray = None,
+    blend_lambda: float = 1.0,
+) -> dict:
     raw_grad = grads[0].detach().cpu().numpy()
     abs_map = np.abs(raw_grad).max(axis=0)
 
@@ -215,11 +242,14 @@ def _prepare_gradient_arrays(grads: torch.Tensor) -> dict:
     clipped_map[clipped_map > hi] = hi
     clipped_map[clipped_map < lo] = lo
 
-    denom = np.max(clipped_map) - np.min(clipped_map)
-    if denom <= 1e-12:
-        normalized_map = np.zeros_like(clipped_map)
-    else:
-        normalized_map = (clipped_map - np.min(clipped_map)) / denom
+    normalized_map = _normalize_01(clipped_map)
+
+    applied_prior = False
+    if prior_map is not None:
+        lam = float(np.clip(blend_lambda, 0.0, 1.0))
+        prior_norm = _normalize_01(np.asarray(prior_map, dtype=np.float32))
+        normalized_map = _normalize_01(lam * normalized_map + (1.0 - lam) * prior_norm)
+        applied_prior = True
 
     heatmap_mask = np.ones_like(normalized_map) - normalized_map
     heatmap_mask = cv2.GaussianBlur(heatmap_mask, (3, 3), 0)
@@ -231,6 +261,61 @@ def _prepare_gradient_arrays(grads: torch.Tensor) -> dict:
         'heatmap_mask': heatmap_mask,
         'percentile_low': float(lo),
         'percentile_high': float(hi),
+        'applied_prior': applied_prior,
+    }
+
+
+def _box_to_bounds(item: dict, hw: tuple) -> tuple:
+    h, w = int(hw[0]), int(hw[1])
+    x1, y1, x2, y2 = item['box']
+    x1 = max(0, min(w, int(np.floor(x1))))
+    y1 = max(0, min(h, int(np.floor(y1))))
+    x2 = max(0, min(w, int(np.ceil(x2))))
+    y2 = max(0, min(h, int(np.ceil(y2))))
+    return x1, y1, x2, y2
+
+
+def _build_box_prior_map(hw: tuple, items: list) -> np.ndarray:
+    h, w = int(hw[0]), int(hw[1])
+    prior = np.zeros((h, w), dtype=np.float32)
+    if not items:
+        return prior
+
+    for item in items:
+        x1, y1, x2, y2 = _box_to_bounds(item, (h, w))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        prior[y1:y2, x1:x2] += 1.0
+
+    return _normalize_01(prior)
+
+
+def _build_hotness_prior_maps(reference_image, detection_overlay, args) -> dict:
+    if detection_overlay is None:
+        return {}
+
+    h = int(reference_image.shape[-2])
+    w = int(reference_image.shape[-1])
+
+    prior_tp = _build_box_prior_map((h, w), detection_overlay.get('tp', []))
+    prior_fn = _build_box_prior_map((h, w), detection_overlay.get('fn', []))
+    prior_fp_a = _build_box_prior_map((h, w), detection_overlay.get('fp_loc', []))
+    prior_fp_b = _build_box_prior_map((h, w), detection_overlay.get('fp_cls', []))
+
+    w_tp = float(args.det_hotness_weight_tp)
+    w_fn = float(args.det_hotness_weight_fn)
+    w_fp_a = float(args.det_hotness_weight_fp_a)
+    w_fp_b = float(args.det_hotness_weight_fp_b)
+    total = w_tp * prior_tp + w_fn * prior_fn + w_fp_a * prior_fp_a + w_fp_b * prior_fp_b
+
+    return {
+        'tp': _normalize_01(prior_tp),
+        'fn': _normalize_01(prior_fn),
+        'fp_a': _normalize_01(prior_fp_a),
+        'fp_b': _normalize_01(prior_fp_b),
+        'fp_loc': _normalize_01(prior_fp_a),
+        'fp_cls': _normalize_01(prior_fp_b),
+        'total': _normalize_01(total),
     }
 
 
@@ -447,6 +532,7 @@ def _save_component_gradient_exports(
     inv_transform_test,
     objective_context=None,
     detection_overlay=None,
+    prior_maps=None,
 ):
     if not component_gradients:
         return
@@ -477,6 +563,13 @@ def _save_component_gradient_exports(
         'det_fp_loc_iou_threshold': args.det_fp_loc_iou_threshold,
         'det_fp_loc_gate_sharpness': args.det_fp_loc_gate_sharpness,
         'det_fp_loc_score_power': args.det_fp_loc_score_power,
+        'det_fp_cls_margin': args.det_fp_cls_margin,
+        'det_hotness_weight_tp': args.det_hotness_weight_tp,
+        'det_hotness_weight_fn': args.det_hotness_weight_fn,
+        'det_hotness_weight_fp_a': args.det_hotness_weight_fp_a,
+        'det_hotness_weight_fp_b': args.det_hotness_weight_fp_b,
+        'det_hotness_gate_alpha': args.det_hotness_gate_alpha,
+        'det_hotness_lambda': args.det_hotness_lambda,
         'input_saliency_method': args.input_saliency_method,
         'noise_iters': args.noise_iters,
         'noise_percent': args.noise_percent,
@@ -488,7 +581,14 @@ def _save_component_gradient_exports(
     }
 
     for component_name, grads in component_gradients.items():
-        arrays = _prepare_gradient_arrays(grads)
+        component_prior = None
+        if prior_maps:
+            component_prior = prior_maps.get(component_name)
+        arrays = _prepare_gradient_arrays(
+            grads,
+            prior_map=component_prior,
+            blend_lambda=args.det_hotness_lambda,
+        )
         if args.save_npy:
             np.save(os.path.join(raw_dir, f'{save_name}_{component_name}_raw_grad.npy'), arrays['raw_grad'])
             np.save(os.path.join(map_dir, f'{save_name}_{component_name}_abs_map.npy'), arrays['abs_map'])
@@ -507,6 +607,7 @@ def _save_component_gradient_exports(
             'loss_value': float(component_losses.get(component_name, float('nan'))),
             'percentile_low': arrays['percentile_low'],
             'percentile_high': arrays['percentile_high'],
+            'applied_hotness_prior': bool(arrays.get('applied_prior', False)),
             'raw_gradient_path': (
                 os.path.join('raw_gradients', f'{save_name}_{component_name}_raw_grad.npy')
                 if args.save_npy else None
@@ -694,6 +795,12 @@ def _build_detection_objective_context(args, reference_image):
         'det_fp_loc_iou_threshold': args.det_fp_loc_iou_threshold,
         'det_fp_loc_gate_sharpness': args.det_fp_loc_gate_sharpness,
         'det_fp_loc_score_power': args.det_fp_loc_score_power,
+        'det_fp_cls_margin': args.det_fp_cls_margin,
+        'det_hotness_weight_tp': args.det_hotness_weight_tp,
+        'det_hotness_weight_fn': args.det_hotness_weight_fn,
+        'det_hotness_weight_fp_a': args.det_hotness_weight_fp_a,
+        'det_hotness_weight_fp_b': args.det_hotness_weight_fp_b,
+        'det_hotness_gate_alpha': args.det_hotness_gate_alpha,
         'det_empty_gt_policy': args.det_empty_gt_policy,
         'det_effective_objective_mode': args.det_objective_mode,
     }
@@ -719,6 +826,13 @@ def _build_detection_objective_context(args, reference_image):
                 np.zeros((0,), dtype=np.int64),
             )
         ]
+        if args.det_objective_mode == 'hotness_unified':
+            context['det_effective_objective_mode'] = 'hotness_unified_empty_gt'
+            print(
+                'No COCO GT instances were found for the selected image. '
+                'Using unified hotness objective with FP-A-only active terms for this empty-image case.'
+            )
+            return context
         if args.det_empty_gt_policy == 'fp_loc_only':
             context['det_effective_objective_mode'] = 'fp_loc_only'
             print(
@@ -1152,8 +1266,19 @@ def _export_model_checkpoint(model, args) -> None:
     print(f'Exported loaded model checkpoint to {args.export_model_pth}')
 
 
-def save_gradients(grads_to_save, args, reference_image, inv_transform_test, detection_overlay=None):
-    arrays = _prepare_gradient_arrays(grads_to_save)
+def save_gradients(
+    grads_to_save,
+    args,
+    reference_image,
+    inv_transform_test,
+    detection_overlay=None,
+    prior_map=None,
+):
+    arrays = _prepare_gradient_arrays(
+        grads_to_save,
+        prior_map=prior_map,
+        blend_lambda=args.det_hotness_lambda,
+    )
     save_path = os.path.join(_per_image_output_dir(args), args.figure_folder_name)
     os.makedirs(save_path, exist_ok=True)
     save_name = _reference_save_name(args)
@@ -1519,6 +1644,10 @@ if __name__ == '__main__':
         print(f'Input tensor saved to {input_tensor_path}')
 
     detection_overlay = _build_detection_overlay(reference_image, net, args)
+    prior_maps = {}
+    if detection_overlay is not None and args.task == 'detection' and args.det_objective_mode == 'hotness_unified':
+        prior_maps = _build_hotness_prior_maps(reference_image, detection_overlay, args)
+
     if detection_overlay is not None:
         _save_detection_box_overlays(
             reference_image,
@@ -1534,6 +1663,7 @@ if __name__ == '__main__':
         reference_image,
         inv_transform_test,
         detection_overlay=detection_overlay,
+        prior_map=prior_maps.get('total') if prior_maps else None,
     )
     _save_component_gradient_exports(
         component_gradients,
@@ -1543,6 +1673,7 @@ if __name__ == '__main__':
         inv_transform_test,
         objective_context=objective_context,
         detection_overlay=detection_overlay,
+        prior_maps=prior_maps,
     )
 
     fig, ax = plt.subplots(1, 1, figsize=(15, 4))
