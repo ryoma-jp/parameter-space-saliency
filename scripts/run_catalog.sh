@@ -78,7 +78,7 @@ echo ""
 echo "=== Step 3: Generating EDA notebook ==="
 docker compose run "${DOCKER_COMMON_OPTS[@]}" pss \
     bash -lc 'set -euo pipefail
-    python3 tools/object_analysis/generate_eda_notebook.py'
+    python3 tools/object_analysis/generate_eda_notebook.py --results_root "$RESULTS_ROOT"'
 
 echo ""
 echo "=== All steps completed ==="

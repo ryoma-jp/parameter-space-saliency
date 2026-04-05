@@ -5,13 +5,26 @@ generate_eda_notebook.py
 方式1 EDA Notebook を nbformat で生成する。
 
 実行:
-  docker compose run --rm pss python tools/object_analysis/generate_eda_notebook.py
+    docker compose run --rm pss python tools/object_analysis/generate_eda_notebook.py
+    docker compose run --rm pss python tools/object_analysis/generate_eda_notebook.py \
+            --results_root results/yolox_tiny_custom_model_auto
 """
 
+import argparse
 import nbformat as nbf
 from pathlib import Path
 
-OUT_PATH = Path("results/yolox_tiny_custom_model_auto/reports/eda_method1.ipynb")
+parser = argparse.ArgumentParser(description="Generate method1 EDA notebook")
+parser.add_argument(
+        "--results_root",
+        default="results/yolox_tiny_custom_model_auto",
+        help="Results root directory (default: results/yolox_tiny_custom_model_auto)",
+)
+args = parser.parse_args()
+
+RESULTS_ROOT = args.results_root
+
+OUT_PATH = Path(f"{RESULTS_ROOT}/reports/eda_method1.ipynb")
 OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 nb = nbf.v4.new_notebook()
@@ -29,7 +42,7 @@ docker compose run --rm pss python tools/object_analysis/precompute_method1.py
 
 # ---------------------------------------------------------------------------
 # Setup
-cells.append(nbf.v4.new_code_cell("""\
+cells.append(nbf.v4.new_code_cell(f"""\
 from pathlib import Path
 import pandas as pd
 import numpy as np
@@ -42,9 +55,9 @@ plt.rcParams["figure.dpi"] = 120
 # Docker コンテナ内ではワークスペースは /work に固定
 # ホスト上で直接実行する場合は ROOT を書き換えてください
 ROOT     = Path("/work")
-AGG_DIR  = ROOT / "results/yolox_tiny_custom_model_auto/aggregates"
-ANAL_DIR = ROOT / "results/yolox_tiny_custom_model_auto/analysis"
-FIG_DIR  = ROOT / "figures/method1"
+AGG_DIR  = ROOT / "{RESULTS_ROOT}/aggregates"
+ANAL_DIR = ROOT / "{RESULTS_ROOT}/analysis"
+FIG_DIR  = ROOT / "{RESULTS_ROOT}/reports/figures/method1"
 FIG_DIR.mkdir(parents=True, exist_ok=True)
 
 df      = pd.read_csv(AGG_DIR / "objects_flat.csv")
@@ -55,12 +68,12 @@ feat_df = pd.read_csv(ANAL_DIR / "feature_stats.csv")
 df["size_band"]    = pd.Categorical(df["size_band"],    categories=["xs","s","m","l"], ordered=True)
 sb_df["size_band"] = pd.Categorical(sb_df["size_band"], categories=["xs","s","m","l"], ordered=True)
 
-print(f"Total records : {len(df):,}")
+print(f"Total records : {{len(df):,}}")
 print(df["result_type"].value_counts())
 """))
 
 # ---------------------------------------------------------------------------
-# 1. KPI
+# 1. KPI Summary
 cells.append(nbf.v4.new_markdown_cell("## 1. KPI サマリ"))
 cells.append(nbf.v4.new_code_cell("""\
 tp = df["is_correct"].sum()

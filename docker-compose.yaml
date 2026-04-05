@@ -3,7 +3,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    user: "${UID}:${GID}"
+      args:
+        UID: "${UID}"
+        GID: "${GID}"
+        USERNAME: "${USERNAME}"
     working_dir: /work
     command: >
       bash -c "jupyter notebook"
