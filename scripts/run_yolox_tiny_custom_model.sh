@@ -12,7 +12,7 @@ IMAGE_DIR=raw_images/coco2017/val2017
 
 # Custom model constructor arguments passed to `yolox.models.build.yolox_custom`.
 # Adjust `exp_path` or `ckpt_path` when switching YOLOX variants or checkpoints.
-MODEL_KWARGS_JSON='{"exp_path":"/work/externals/YOLOX/exps/default/yolox_tiny.py","ckpt_path":"externals/YOLOX/weights/yolox_tiny.pth","device":"cpu"}'
+MODEL_KWARGS_JSON='{"exp_path":"/work/externals/YOLOX/exps/default/yolox_tiny.py","ckpt_path":"externals/YOLOX/weights/yolox_tiny.pth"}'
 
 # Input preprocessing configuration consumed by the adapter.
 # `letterbox=true` should stay aligned with the training / inference setup.

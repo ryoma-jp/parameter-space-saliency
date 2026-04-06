@@ -1454,6 +1454,11 @@ if __name__ == '__main__':
         torch.cuda.manual_seed_all(40)
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f'Runtime device selected: {device}')
+    if device == 'cuda':
+        print(f'CUDA device count: {torch.cuda.device_count()}')
+        print(f'CUDA current device: {torch.cuda.current_device()}')
+        print(f'CUDA device name: {torch.cuda.get_device_name(torch.cuda.current_device())}')
     args   = parser.parse_args()
 
     if args.logit or args.logit_difference:
@@ -1484,6 +1489,13 @@ if __name__ == '__main__':
         net = torch.nn.DataParallel(net)
         cudnn.benchmark    = False
         cudnn.deterministic = True
+
+    model_param_device = (
+        next(net.module.parameters()).device
+        if isinstance(net, torch.nn.DataParallel)
+        else next(net.parameters()).device
+    )
+    print(f'Model parameter device: {model_param_device}')
 
     # ------------------------------------------------------------------ #
     # Task & target                                                        #
