@@ -23,7 +23,7 @@ PREPROCESS_CFG_JSON='{"resize":[416,416],"letterbox":true,"pad_value":114,"chann
 #   - test: process only the first TEST_MAX_FILES images after sorting
 #   - full: process all discovered images
 RUN_MODE=${RUN_MODE:-test}
-TEST_MAX_FILES=${TEST_MAX_FILES:-100}
+TEST_MAX_FILES=${TEST_MAX_FILES:-10}
 
 # ---------------------------------------------------------------------------
 # Unified hotness objective settings
@@ -117,6 +117,7 @@ for method in auto; do
     OUTPUT_ROOT="${OUTPUT_ROOT_BASE}_${method}"
     echo "Running input saliency with method=${method}, det_objective_mode=${DET_OBJECTIVE_MODE}, det_fp_loc_weight=${DET_FP_LOC_WEIGHT}"
     rm -rf "$OUTPUT_ROOT"
+    mkdir -p "$OUTPUT_ROOT"
 
     docker compose run --rm \
         -e HOME=/work \
@@ -178,9 +179,23 @@ for method in auto; do
                     ;;
             esac
 
+            csv_file="$OUTPUT_ROOT/timing_runtime.csv"
+            if [ ! -f "$csv_file" ]; then
+                echo "record_type,timestamp,method,run_mode,output_root,image_index,image_count,image_path,elapsed_ms,total_elapsed_ms,avg_elapsed_ms,det_objective_mode,input_saliency_method" > "$csv_file"
+            fi
+
+            csv_escape() {
+                local v="$1"
+                v="${v//\"/\"\"}"
+                printf '"%s"' "$v"
+            }
+
+            run_start_ms=$(date +%s%3N)
+
             for ((idx = 0; idx < run_total; idx++)); do
                 image_path="${image_paths[$idx]}"
                 echo "[$METHOD][$RUN_MODE] ($((idx + 1))/$run_total) processing: ${image_path}"
+                image_start_ms=$(date +%s%3N)
                 python3 parameter_and_input_saliency.py \
                     --task detection \
                     --model_source custom_module \
@@ -207,5 +222,49 @@ for method in auto; do
                     --det_empty_gt_policy "$DET_EMPTY_GT_POLICY" \
                     --input_saliency_method "$METHOD" \
                     --target_type true_label
-            done'
+                image_end_ms=$(date +%s%3N)
+                image_elapsed_ms=$((image_end_ms - image_start_ms))
+                image_ts=$(date -Iseconds)
+                echo "[$METHOD][$RUN_MODE] ($((idx + 1))/$run_total) elapsed: ${image_elapsed_ms} ms"
+                printf "%s,%s,%s,%s,%s,%d,%d,%s,%d,%s,%s,%s,%s\n" \
+                    "per_image" \
+                    "$(csv_escape "$image_ts")" \
+                    "$(csv_escape "$METHOD")" \
+                    "$(csv_escape "$RUN_MODE")" \
+                    "$(csv_escape "$OUTPUT_ROOT")" \
+                    $((idx + 1)) \
+                    "$run_total" \
+                    "$(csv_escape "$image_path")" \
+                    "$image_elapsed_ms" \
+                    "" \
+                    "" \
+                    "$(csv_escape "$DET_OBJECTIVE_MODE")" \
+                    "$(csv_escape "$METHOD")" \
+                    >> "$csv_file"
+            done
+
+            run_end_ms=$(date +%s%3N)
+            total_elapsed_ms=$((run_end_ms - run_start_ms))
+            if [ "$run_total" -gt 0 ]; then
+                avg_elapsed_ms=$((total_elapsed_ms / run_total))
+            else
+                avg_elapsed_ms=0
+            fi
+            run_ts=$(date -Iseconds)
+            echo "[$METHOD][$RUN_MODE] summary: images=${run_total}, total_elapsed_ms=${total_elapsed_ms}, avg_elapsed_ms=${avg_elapsed_ms}"
+            printf "%s,%s,%s,%s,%s,%s,%d,%s,%s,%d,%d,%s,%s\n" \
+                "summary" \
+                "$(csv_escape "$run_ts")" \
+                "$(csv_escape "$METHOD")" \
+                "$(csv_escape "$RUN_MODE")" \
+                "$(csv_escape "$OUTPUT_ROOT")" \
+                "" \
+                "$run_total" \
+                "" \
+                "" \
+                "$total_elapsed_ms" \
+                "$avg_elapsed_ms" \
+                "$(csv_escape "$DET_OBJECTIVE_MODE")" \
+                "$(csv_escape "$METHOD")" \
+                >> "$csv_file"'
 done
