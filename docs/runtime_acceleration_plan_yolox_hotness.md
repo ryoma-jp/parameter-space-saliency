@@ -40,18 +40,20 @@ Use one of these values in the status column:
 | A5 | Optimize visualization/write pipeline (same outputs) | Low-Medium (5% - 20%) | not-started | TBD | Keep file set and semantics unchanged |
 | A6 | CUDA runtime tuning (`cudnn.benchmark`, etc.) | Low-Medium (5% - 25%) | not-started | TBD | Verify reproducibility requirements |
 | A7 | Mixed precision (AMP) for speed-up | Medium (1.2x - 1.8x after GPU) | not-started | TBD | Only if numerical tolerance is acceptable |
+| A8 | Disable DataParallel when running on a single GPU | Low (5% - 15%) | not-started | TBD | Change condition to `device == 'cuda' and torch.cuda.device_count() > 1`; eliminates scatter/gather overhead |
 
 ---
 
 ## Recommended Execution Order
 
 1. A1: GPU enablement
-2. A2: process-level parallelism
-3. A3: annotation lookup optimization
-4. A4: storage/mount optimization
-5. A5: visualization/write optimization
-6. A6: CUDA runtime tuning
-7. A7: AMP (optional)
+2. A8: disable DataParallel on single GPU (low risk, quick win)
+3. A2: process-level parallelism
+4. A3: annotation lookup optimization
+5. A4: storage/mount optimization
+6. A5: visualization/write optimization
+7. A6: CUDA runtime tuning
+8. A7: AMP (optional)
 
 ---
 
@@ -68,7 +70,27 @@ Validation logs:
 - `CUDA current device: 0`
 - `CUDA device name: NVIDIA GeForce RTX 4070 Ti`
 
-### 2) Worker Parallelism (A2)
+### 2) Disable DataParallel on Single GPU (A8)
+
+Background:
+
+`torch.nn.DataParallel` is designed for multi-GPU setups. When only one GPU is present, it still runs `scatter` (split input) and `gather` (merge output) on every forward pass, adding CUDA stream synchronization overhead. With batch size 1 (this project processes one image per process), the entire batch lands on GPU 0 anyway — so scatter/gather is pure overhead.
+
+Change in `parameter_and_input_saliency.py`:
+
+```python
+# Before
+if device == 'cuda':
+    net = torch.nn.DataParallel(net)
+
+# After
+if device == 'cuda' and torch.cuda.device_count() > 1:
+    net = torch.nn.DataParallel(net)
+```
+
+Additional simplification: the `.module` unwrap guards throughout the code (`net.module if isinstance(net, torch.nn.DataParallel) else net`) remain valid and correct — no other changes needed.
+
+### 3) Worker Parallelism (A2)
 
 Introduce configurable workers while preserving image-wise execution.
 
@@ -92,8 +114,9 @@ These are planning estimates before measurement.
 |---|---:|---:|
 | Baseline (current) | 1.00 | 1.0x |
 | A1 only (GPU) | 0.40 - 0.12 | 2.5x - 8.3x |
-| A1 + A2 | 0.30 - 0.07 | 3.3x - 14.3x |
-| A1 + A2 + A3 + A4 | 0.24 - 0.05 | 4.2x - 20.0x |
+| A1 + A8 | 0.37 - 0.10 | 2.7x - 10.0x |
+| A1 + A8 + A2 | 0.28 - 0.07 | 3.6x - 14.3x |
+| A1 + A8 + A2 + A3 + A4 | 0.22 - 0.05 | 4.5x - 20.0x |
 
 Notes:
 
@@ -142,5 +165,6 @@ Append updates in this format:
 
 - Script-level run mode (`test` / `full`) is already available.
 - A1 is complete: runtime device is confirmed as CUDA (NVIDIA GeForce RTX 4070 Ti).
+- A8 is identified: DataParallel is currently enabled unconditionally on CUDA, but RTX 4070 Ti is a single GPU. Disabling it removes scatter/gather overhead at zero functional cost.
 - Main remaining bottlenecks are process-level parallelism and data/IO overhead.
 - No processing step should be removed for this acceleration track.

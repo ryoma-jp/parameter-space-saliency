@@ -25,6 +25,11 @@ PREPROCESS_CFG_JSON='{"resize":[416,416],"letterbox":true,"pad_value":114,"chann
 RUN_MODE=${RUN_MODE:-test}
 TEST_MAX_FILES=${TEST_MAX_FILES:-10}
 
+# Number of images to process in parallel inside the container.
+# 1 = sequential (default); increase based on available GPU memory.
+# On a single GPU (e.g. RTX 4070 Ti 12 GB), PARALLEL_JOBS=2 is a safe starting point.
+PARALLEL_JOBS=${PARALLEL_JOBS:-2}
+
 # ---------------------------------------------------------------------------
 # Unified hotness objective settings
 # ---------------------------------------------------------------------------
@@ -128,6 +133,7 @@ for method in auto; do
         -e OUTPUT_ROOT="$OUTPUT_ROOT" \
         -e RUN_MODE="$RUN_MODE" \
         -e TEST_MAX_FILES="$TEST_MAX_FILES" \
+        -e PARALLEL_JOBS="$PARALLEL_JOBS" \
         -e MODEL_KWARGS_JSON="$MODEL_KWARGS_JSON" \
         -e PREPROCESS_CFG_JSON="$PREPROCESS_CFG_JSON" \
         -e DET_OBJECTIVE_MODE="$DET_OBJECTIVE_MODE" \
@@ -190,58 +196,88 @@ for method in auto; do
                 printf '"%s"' "$v"
             }
 
+            # Temp directory for per-image CSV records; merged in order after all jobs complete.
+            tmp_dir=$(mktemp -d)
+
+            # Array of active background job PIDs.
+            active_pids=()
+
+            # Wait for all tracked jobs and clear the list. Emits a warning on any failure.
+            flush_active_pids() {
+                for pid in "${active_pids[@]}"; do
+                    wait "$pid" || echo "[WARN] background job (pid=$pid) exited with non-zero status"
+                done
+                active_pids=()
+            }
+
             run_start_ms=$(date +%s%3N)
 
             for ((idx = 0; idx < run_total; idx++)); do
                 image_path="${image_paths[$idx]}"
-                echo "[$METHOD][$RUN_MODE] ($((idx + 1))/$run_total) processing: ${image_path}"
-                image_start_ms=$(date +%s%3N)
-                python3 parameter_and_input_saliency.py \
-                    --task detection \
-                    --model_source custom_module \
-                    --model_import_root /work/externals/YOLOX \
-                    --model_class_path yolox.models.build.yolox_custom \
-                    --model_kwargs_json "$MODEL_KWARGS_JSON" \
-                    --preprocess_cfg_json "$PREPROCESS_CFG_JSON" \
-                    --image_path "$image_path" \
-                    --det_annotations_json raw_images/coco2017/annotations/instances_val2017.json \
-                    --output_root "$OUTPUT_ROOT" \
-                        --det_objective_mode "$DET_OBJECTIVE_MODE" \
-                        --det_objective_provider "$DET_OBJECTIVE_PROVIDER" \
-                    --det_fp_loc_weight "$DET_FP_LOC_WEIGHT" \
-                    --det_fp_loc_iou_threshold "$DET_FP_LOC_IOU_THRESHOLD" \
-                    --det_fp_loc_gate_sharpness "$DET_FP_LOC_GATE_SHARPNESS" \
-                    --det_fp_loc_score_power "$DET_FP_LOC_SCORE_POWER" \
-                        --det_fp_cls_margin "$DET_FP_CLS_MARGIN" \
-                        --det_hotness_weight_tp "$DET_HOTNESS_WEIGHT_TP" \
-                        --det_hotness_weight_fn "$DET_HOTNESS_WEIGHT_FN" \
-                        --det_hotness_weight_fp_a "$DET_HOTNESS_WEIGHT_FP_A" \
-                        --det_hotness_weight_fp_b "$DET_HOTNESS_WEIGHT_FP_B" \
-                        --det_hotness_gate_alpha "$DET_HOTNESS_GATE_ALPHA" \
-                        --det_hotness_lambda "$DET_HOTNESS_LAMBDA" \
-                    --det_empty_gt_policy "$DET_EMPTY_GT_POLICY" \
-                    --input_saliency_method "$METHOD" \
-                    --target_type true_label
-                image_end_ms=$(date +%s%3N)
-                image_elapsed_ms=$((image_end_ms - image_start_ms))
-                image_ts=$(date -Iseconds)
-                echo "[$METHOD][$RUN_MODE] ($((idx + 1))/$run_total) elapsed: ${image_elapsed_ms} ms"
-                printf "%s,%s,%s,%s,%s,%d,%d,%s,%d,%s,%s,%s,%s\n" \
-                    "per_image" \
-                    "$(csv_escape "$image_ts")" \
-                    "$(csv_escape "$METHOD")" \
-                    "$(csv_escape "$RUN_MODE")" \
-                    "$(csv_escape "$OUTPUT_ROOT")" \
-                    $((idx + 1)) \
-                    "$run_total" \
-                    "$(csv_escape "$image_path")" \
-                    "$image_elapsed_ms" \
-                    "" \
-                    "" \
-                    "$(csv_escape "$DET_OBJECTIVE_MODE")" \
-                    "$(csv_escape "$METHOD")" \
-                    >> "$csv_file"
+                idx_padded=$(printf "%08d" "$idx")
+                (
+                    echo "[$METHOD][$RUN_MODE] ($((idx + 1))/$run_total) processing: ${image_path}"
+                    image_start_ms=$(date +%s%3N)
+                    python3 parameter_and_input_saliency.py \
+                        --task detection \
+                        --model_source custom_module \
+                        --model_import_root /work/externals/YOLOX \
+                        --model_class_path yolox.models.build.yolox_custom \
+                        --model_kwargs_json "$MODEL_KWARGS_JSON" \
+                        --preprocess_cfg_json "$PREPROCESS_CFG_JSON" \
+                        --image_path "$image_path" \
+                        --det_annotations_json raw_images/coco2017/annotations/instances_val2017.json \
+                        --output_root "$OUTPUT_ROOT" \
+                            --det_objective_mode "$DET_OBJECTIVE_MODE" \
+                            --det_objective_provider "$DET_OBJECTIVE_PROVIDER" \
+                        --det_fp_loc_weight "$DET_FP_LOC_WEIGHT" \
+                        --det_fp_loc_iou_threshold "$DET_FP_LOC_IOU_THRESHOLD" \
+                        --det_fp_loc_gate_sharpness "$DET_FP_LOC_GATE_SHARPNESS" \
+                        --det_fp_loc_score_power "$DET_FP_LOC_SCORE_POWER" \
+                            --det_fp_cls_margin "$DET_FP_CLS_MARGIN" \
+                            --det_hotness_weight_tp "$DET_HOTNESS_WEIGHT_TP" \
+                            --det_hotness_weight_fn "$DET_HOTNESS_WEIGHT_FN" \
+                            --det_hotness_weight_fp_a "$DET_HOTNESS_WEIGHT_FP_A" \
+                            --det_hotness_weight_fp_b "$DET_HOTNESS_WEIGHT_FP_B" \
+                            --det_hotness_gate_alpha "$DET_HOTNESS_GATE_ALPHA" \
+                            --det_hotness_lambda "$DET_HOTNESS_LAMBDA" \
+                        --det_empty_gt_policy "$DET_EMPTY_GT_POLICY" \
+                        --input_saliency_method "$METHOD" \
+                        --target_type true_label
+                    image_end_ms=$(date +%s%3N)
+                    image_elapsed_ms=$((image_end_ms - image_start_ms))
+                    image_ts=$(date -Iseconds)
+                    echo "[$METHOD][$RUN_MODE] ($((idx + 1))/$run_total) elapsed: ${image_elapsed_ms} ms"
+                    printf "%s,%s,%s,%s,%s,%d,%d,%s,%d,%s,%s,%s,%s\n" \
+                        "per_image" \
+                        "$(csv_escape "$image_ts")" \
+                        "$(csv_escape "$METHOD")" \
+                        "$(csv_escape "$RUN_MODE")" \
+                        "$(csv_escape "$OUTPUT_ROOT")" \
+                        $((idx + 1)) \
+                        "$run_total" \
+                        "$(csv_escape "$image_path")" \
+                        "$image_elapsed_ms" \
+                        "" \
+                        "" \
+                        "$(csv_escape "$DET_OBJECTIVE_MODE")" \
+                        "$(csv_escape "$METHOD")" \
+                        > "$tmp_dir/${idx_padded}.csv"
+                ) &
+                active_pids+=("$!")
+                if [ "${#active_pids[@]}" -ge "$PARALLEL_JOBS" ]; then
+                    flush_active_pids
+                fi
             done
+            flush_active_pids
+
+            # Merge per-image records into the CSV file in index order.
+            for ((idx = 0; idx < run_total; idx++)); do
+                idx_padded=$(printf "%08d" "$idx")
+                tmp_file="$tmp_dir/${idx_padded}.csv"
+                [ -f "$tmp_file" ] && cat "$tmp_file" >> "$csv_file"
+            done
+            rm -rf "$tmp_dir"
 
             run_end_ms=$(date +%s%3N)
             total_elapsed_ms=$((run_end_ms - run_start_ms))
@@ -251,7 +287,7 @@ for method in auto; do
                 avg_elapsed_ms=0
             fi
             run_ts=$(date -Iseconds)
-            echo "[$METHOD][$RUN_MODE] summary: images=${run_total}, total_elapsed_ms=${total_elapsed_ms}, avg_elapsed_ms=${avg_elapsed_ms}"
+            echo "[$METHOD][$RUN_MODE] summary: images=${run_total}, parallel_jobs=${PARALLEL_JOBS}, total_elapsed_ms=${total_elapsed_ms}, avg_elapsed_ms=${avg_elapsed_ms}"
             printf "%s,%s,%s,%s,%s,%s,%d,%s,%s,%d,%d,%s,%s\n" \
                 "summary" \
                 "$(csv_escape "$run_ts")" \
