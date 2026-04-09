@@ -26,9 +26,17 @@ RUN_MODE=${RUN_MODE:-test}
 TEST_MAX_FILES=${TEST_MAX_FILES:-10}
 
 # Number of images to process in parallel inside the container.
-# 1 = sequential (default); increase based on available GPU memory.
+# Accepted values:
+#   - <integer> : use this value directly (e.g. 1 = sequential, 2 = two workers)
+#   - auto      : run one probe image first, measure peak GPU memory usage, and
+#                 compute the number of workers automatically from available VRAM.
 # On a single GPU (e.g. RTX 4070 Ti 12 GB), PARALLEL_JOBS=2 is a safe starting point.
-PARALLEL_JOBS=${PARALLEL_JOBS:-2}
+PARALLEL_JOBS=${PARALLEL_JOBS:-auto}
+
+# Safety factor applied when auto-detecting PARALLEL_JOBS.
+# Fraction of free VRAM (after the probe run) considered safe to use for parallel workers.
+# 0.8 = use up to 80 % of the post-probe free VRAM; reduce if OOM occurs.
+GPU_MEMORY_SAFETY=${GPU_MEMORY_SAFETY:-0.8}
 
 # ---------------------------------------------------------------------------
 # Unified hotness objective settings
@@ -134,6 +142,7 @@ for method in auto; do
         -e RUN_MODE="$RUN_MODE" \
         -e TEST_MAX_FILES="$TEST_MAX_FILES" \
         -e PARALLEL_JOBS="$PARALLEL_JOBS" \
+        -e GPU_MEMORY_SAFETY="$GPU_MEMORY_SAFETY" \
         -e MODEL_KWARGS_JSON="$MODEL_KWARGS_JSON" \
         -e PREPROCESS_CFG_JSON="$PREPROCESS_CFG_JSON" \
         -e DET_OBJECTIVE_MODE="$DET_OBJECTIVE_MODE" \
@@ -196,6 +205,40 @@ for method in auto; do
                 printf '"%s"' "$v"
             }
 
+            # ---------------------------------------------------------------------------
+            # Helper: run parameter_and_input_saliency.py for a single image.
+            # Usage: run_one_image <image_path>
+            # ---------------------------------------------------------------------------
+            run_one_image() {
+                local img="$1"
+                python3 parameter_and_input_saliency.py \
+                    --task detection \
+                    --model_source custom_module \
+                    --model_import_root /work/externals/YOLOX \
+                    --model_class_path yolox.models.build.yolox_custom \
+                    --model_kwargs_json "$MODEL_KWARGS_JSON" \
+                    --preprocess_cfg_json "$PREPROCESS_CFG_JSON" \
+                    --image_path "$img" \
+                    --det_annotations_json raw_images/coco2017/annotations/instances_val2017.json \
+                    --output_root "$OUTPUT_ROOT" \
+                        --det_objective_mode "$DET_OBJECTIVE_MODE" \
+                        --det_objective_provider "$DET_OBJECTIVE_PROVIDER" \
+                    --det_fp_loc_weight "$DET_FP_LOC_WEIGHT" \
+                    --det_fp_loc_iou_threshold "$DET_FP_LOC_IOU_THRESHOLD" \
+                    --det_fp_loc_gate_sharpness "$DET_FP_LOC_GATE_SHARPNESS" \
+                    --det_fp_loc_score_power "$DET_FP_LOC_SCORE_POWER" \
+                        --det_fp_cls_margin "$DET_FP_CLS_MARGIN" \
+                        --det_hotness_weight_tp "$DET_HOTNESS_WEIGHT_TP" \
+                        --det_hotness_weight_fn "$DET_HOTNESS_WEIGHT_FN" \
+                        --det_hotness_weight_fp_a "$DET_HOTNESS_WEIGHT_FP_A" \
+                        --det_hotness_weight_fp_b "$DET_HOTNESS_WEIGHT_FP_B" \
+                        --det_hotness_gate_alpha "$DET_HOTNESS_GATE_ALPHA" \
+                        --det_hotness_lambda "$DET_HOTNESS_LAMBDA" \
+                    --det_empty_gt_policy "$DET_EMPTY_GT_POLICY" \
+                    --input_saliency_method "$METHOD" \
+                    --target_type true_label
+            }
+
             # Temp directory for per-image CSV records; merged in order after all jobs complete.
             tmp_dir=$(mktemp -d)
 
@@ -210,40 +253,92 @@ for method in auto; do
                 active_pids=()
             }
 
+            # ---------------------------------------------------------------------------
+            # Auto-detect PARALLEL_JOBS by probing GPU memory on the first image.
+            # Skipped when PARALLEL_JOBS is already set to an integer.
+            # ---------------------------------------------------------------------------
+            probe_start_idx=0
             run_start_ms=$(date +%s%3N)
 
-            for ((idx = 0; idx < run_total; idx++)); do
+            if [ "$PARALLEL_JOBS" = "auto" ]; then
+                if ! command -v nvidia-smi > /dev/null 2>&1; then
+                    echo "[WARN] nvidia-smi not found; PARALLEL_JOBS auto-detect falling back to 1"
+                    PARALLEL_JOBS=1
+                else
+                    echo "[$METHOD] PARALLEL_JOBS=auto: probing GPU memory usage with first image..."
+                    gpu_total_mb=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1 | tr -d " ")
+                    baseline_mb=$(nvidia-smi --query-gpu=memory.used  --format=csv,noheader,nounits | head -1 | tr -d " ")
+
+                    # Background poller: record peak used VRAM while probe runs.
+                    peak_file=$(mktemp)
+                    echo "$baseline_mb" > "$peak_file"
+                    (
+                        while true; do
+                            used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d " ")
+                            peak=$(cat "$peak_file")
+                            [ "${used:-0}" -gt "${peak:-0}" ] && echo "$used" > "$peak_file"
+                            sleep 0.3
+                        done
+                    ) &
+                    poller_pid=$!
+
+                    # Run probe synchronously so VRAM is measured accurately.
+                    probe_image="${image_paths[0]}"
+                    probe_start_ms=$(date +%s%3N)
+                    run_one_image "$probe_image"
+                    probe_end_ms=$(date +%s%3N)
+                    probe_elapsed_ms=$((probe_end_ms - probe_start_ms))
+
+                    kill "$poller_pid" 2>/dev/null || true
+                    wait "$poller_pid" 2>/dev/null || true
+                    peak_mb=$(cat "$peak_file")
+                    rm -f "$peak_file"
+
+                    per_image_mb=$((peak_mb - baseline_mb))
+                    # Measure free VRAM after probe process has exited and released all GPU memory.
+                    free_after_mb=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | head -1 | tr -d " ")
+
+                    if [ "$per_image_mb" -gt 0 ]; then
+                        PARALLEL_JOBS=$(awk -v free="$free_after_mb" \
+                                            -v per="$per_image_mb" \
+                                            -v safety="$GPU_MEMORY_SAFETY" \
+                            "BEGIN { v = int(free * safety / per); print (v < 1 ? 1 : v) }")
+                    else
+                        echo "[WARN] per_image_mb=0; GPU delta unmeasurable, falling back to PARALLEL_JOBS=1"
+                        PARALLEL_JOBS=1
+                    fi
+
+                    echo "[$METHOD] GPU probe: total=${gpu_total_mb}MiB baseline=${baseline_mb}MiB peak=${peak_mb}MiB per_image=${per_image_mb}MiB free_after=${free_after_mb}MiB safety=${GPU_MEMORY_SAFETY} → PARALLEL_JOBS=${PARALLEL_JOBS}"
+
+                    # Record probe timing as the CSV entry for image index 1 (0-padded file 00000000).
+                    probe_ts=$(date -Iseconds)
+                    printf "%s,%s,%s,%s,%s,%d,%d,%s,%d,%s,%s,%s,%s\n" \
+                        "per_image" \
+                        "$(csv_escape "$probe_ts")" \
+                        "$(csv_escape "$METHOD")" \
+                        "$(csv_escape "$RUN_MODE")" \
+                        "$(csv_escape "$OUTPUT_ROOT")" \
+                        1 \
+                        "$run_total" \
+                        "$(csv_escape "$probe_image")" \
+                        "$probe_elapsed_ms" \
+                        "" \
+                        "" \
+                        "$(csv_escape "$DET_OBJECTIVE_MODE")" \
+                        "$(csv_escape "$METHOD")" \
+                        > "$tmp_dir/00000000.csv"
+
+                    probe_start_idx=1
+                fi
+            fi
+
+            for ((idx = probe_start_idx; idx < run_total; idx++)); do
                 image_path="${image_paths[$idx]}"
                 idx_padded=$(printf "%08d" "$idx")
                 (
                     echo "[$METHOD][$RUN_MODE] ($((idx + 1))/$run_total) processing: ${image_path}"
                     image_start_ms=$(date +%s%3N)
-                    python3 parameter_and_input_saliency.py \
-                        --task detection \
-                        --model_source custom_module \
-                        --model_import_root /work/externals/YOLOX \
-                        --model_class_path yolox.models.build.yolox_custom \
-                        --model_kwargs_json "$MODEL_KWARGS_JSON" \
-                        --preprocess_cfg_json "$PREPROCESS_CFG_JSON" \
-                        --image_path "$image_path" \
-                        --det_annotations_json raw_images/coco2017/annotations/instances_val2017.json \
-                        --output_root "$OUTPUT_ROOT" \
-                            --det_objective_mode "$DET_OBJECTIVE_MODE" \
-                            --det_objective_provider "$DET_OBJECTIVE_PROVIDER" \
-                        --det_fp_loc_weight "$DET_FP_LOC_WEIGHT" \
-                        --det_fp_loc_iou_threshold "$DET_FP_LOC_IOU_THRESHOLD" \
-                        --det_fp_loc_gate_sharpness "$DET_FP_LOC_GATE_SHARPNESS" \
-                        --det_fp_loc_score_power "$DET_FP_LOC_SCORE_POWER" \
-                            --det_fp_cls_margin "$DET_FP_CLS_MARGIN" \
-                            --det_hotness_weight_tp "$DET_HOTNESS_WEIGHT_TP" \
-                            --det_hotness_weight_fn "$DET_HOTNESS_WEIGHT_FN" \
-                            --det_hotness_weight_fp_a "$DET_HOTNESS_WEIGHT_FP_A" \
-                            --det_hotness_weight_fp_b "$DET_HOTNESS_WEIGHT_FP_B" \
-                            --det_hotness_gate_alpha "$DET_HOTNESS_GATE_ALPHA" \
-                            --det_hotness_lambda "$DET_HOTNESS_LAMBDA" \
-                        --det_empty_gt_policy "$DET_EMPTY_GT_POLICY" \
-                        --input_saliency_method "$METHOD" \
-                        --target_type true_label
+                    run_one_image "$image_path"
                     image_end_ms=$(date +%s%3N)
                     image_elapsed_ms=$((image_end_ms - image_start_ms))
                     image_ts=$(date -Iseconds)
