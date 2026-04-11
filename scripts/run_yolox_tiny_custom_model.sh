@@ -98,11 +98,10 @@ DET_HOTNESS_WEIGHT_FP_B=${DET_HOTNESS_WEIGHT_FP_B:-1.0}
 # Increasing alpha suppresses low-loss contributions more aggressively and strengthens TP suppression.
 DET_HOTNESS_GATE_ALPHA=${DET_HOTNESS_GATE_ALPHA:-1.0}
 
-# Blend ratio between gradient map and spatial prior map.
-# 1.0: gradient only
-# 0.0: spatial prior only
-# Starting around 0.4 - 0.7 is usually a reasonable choice.
-DET_HOTNESS_LAMBDA=${DET_HOTNESS_LAMBDA:-0.6}
+# Disable gated component maps when set to 1.
+# 0: export gradients/images for tp_gated/fn_gated/fp_a_gated/fp_b_gated (legacy behavior)
+# 1: skip gated component gradients and gated PNG exports
+DET_DISABLE_GATED_COMPONENTS=${DET_DISABLE_GATED_COMPONENTS:-1}
 
 # Behavior for images with no GT annotation.
 # Using fp_loc_only makes empty images behave as FP-A-dominant cases.
@@ -179,7 +178,7 @@ for method in auto; do
         -e DET_HOTNESS_WEIGHT_FP_A="$DET_HOTNESS_WEIGHT_FP_A" \
         -e DET_HOTNESS_WEIGHT_FP_B="$DET_HOTNESS_WEIGHT_FP_B" \
         -e DET_HOTNESS_GATE_ALPHA="$DET_HOTNESS_GATE_ALPHA" \
-        -e DET_HOTNESS_LAMBDA="$DET_HOTNESS_LAMBDA" \
+        -e DET_DISABLE_GATED_COMPONENTS="$DET_DISABLE_GATED_COMPONENTS" \
         -e DET_EMPTY_GT_POLICY="$DET_EMPTY_GT_POLICY" \
         -e METHOD="$method" \
         pss \
@@ -250,6 +249,10 @@ for method in auto; do
             # ---------------------------------------------------------------------------
             run_one_image() {
                 local img="$1"
+                local gated_flag=()
+                if [ "${DET_DISABLE_GATED_COMPONENTS:-0}" = "1" ]; then
+                    gated_flag+=(--det_disable_gated_components)
+                fi
                 python3 parameter_and_input_saliency.py \
                     --task detection \
                     --model_source custom_module \
@@ -272,7 +275,7 @@ for method in auto; do
                         --det_hotness_weight_fp_a "$DET_HOTNESS_WEIGHT_FP_A" \
                         --det_hotness_weight_fp_b "$DET_HOTNESS_WEIGHT_FP_B" \
                         --det_hotness_gate_alpha "$DET_HOTNESS_GATE_ALPHA" \
-                        --det_hotness_lambda "$DET_HOTNESS_LAMBDA" \
+                        "${gated_flag[@]}" \
                     --det_empty_gt_policy "$DET_EMPTY_GT_POLICY" \
                     --input_saliency_method "$METHOD" \
                     --target_type true_label

@@ -142,8 +142,8 @@ parser.add_argument('--det_hotness_weight_fp_b', default=1.0, type=float,
                     help='weight of FP-B term (class confusion) in unified hotness objective')
 parser.add_argument('--det_hotness_gate_alpha', default=1.0, type=float,
                     help='alpha of power-gating g(L)=L^alpha in unified hotness objective')
-parser.add_argument('--det_hotness_lambda', default=0.6, type=float,
-                help='blend ratio between normalized gradient map and spatial prior map')
+parser.add_argument('--det_disable_gated_components', action='store_true',
+                    help='skip gradient computation and image export for *_gated components')
 parser.add_argument('--det_empty_gt_policy',
                     default='error',
                     choices=['error', 'fp_loc_only'],
@@ -230,8 +230,6 @@ def _normalize_01(arr: np.ndarray) -> np.ndarray:
 
 def _prepare_gradient_arrays(
     grads: torch.Tensor,
-    prior_map: np.ndarray = None,
-    blend_lambda: float = 1.0,
 ) -> dict:
     raw_grad = grads[0].detach().cpu().numpy()
     abs_map = np.abs(raw_grad).max(axis=0)
@@ -244,13 +242,6 @@ def _prepare_gradient_arrays(
 
     normalized_map = _normalize_01(clipped_map)
 
-    applied_prior = False
-    if prior_map is not None:
-        lam = float(np.clip(blend_lambda, 0.0, 1.0))
-        prior_norm = _normalize_01(np.asarray(prior_map, dtype=np.float32))
-        normalized_map = _normalize_01(lam * normalized_map + (1.0 - lam) * prior_norm)
-        applied_prior = True
-
     heatmap_mask = np.ones_like(normalized_map) - normalized_map
     heatmap_mask = cv2.GaussianBlur(heatmap_mask, (3, 3), 0)
 
@@ -261,61 +252,6 @@ def _prepare_gradient_arrays(
         'heatmap_mask': heatmap_mask,
         'percentile_low': float(lo),
         'percentile_high': float(hi),
-        'applied_prior': applied_prior,
-    }
-
-
-def _box_to_bounds(item: dict, hw: tuple) -> tuple:
-    h, w = int(hw[0]), int(hw[1])
-    x1, y1, x2, y2 = item['box']
-    x1 = max(0, min(w, int(np.floor(x1))))
-    y1 = max(0, min(h, int(np.floor(y1))))
-    x2 = max(0, min(w, int(np.ceil(x2))))
-    y2 = max(0, min(h, int(np.ceil(y2))))
-    return x1, y1, x2, y2
-
-
-def _build_box_prior_map(hw: tuple, items: list) -> np.ndarray:
-    h, w = int(hw[0]), int(hw[1])
-    prior = np.zeros((h, w), dtype=np.float32)
-    if not items:
-        return prior
-
-    for item in items:
-        x1, y1, x2, y2 = _box_to_bounds(item, (h, w))
-        if x2 <= x1 or y2 <= y1:
-            continue
-        prior[y1:y2, x1:x2] += 1.0
-
-    return _normalize_01(prior)
-
-
-def _build_hotness_prior_maps(reference_image, detection_overlay, args) -> dict:
-    if detection_overlay is None:
-        return {}
-
-    h = int(reference_image.shape[-2])
-    w = int(reference_image.shape[-1])
-
-    prior_tp = _build_box_prior_map((h, w), detection_overlay.get('tp', []))
-    prior_fn = _build_box_prior_map((h, w), detection_overlay.get('fn', []))
-    prior_fp_a = _build_box_prior_map((h, w), detection_overlay.get('fp_loc', []))
-    prior_fp_b = _build_box_prior_map((h, w), detection_overlay.get('fp_cls', []))
-
-    w_tp = float(args.det_hotness_weight_tp)
-    w_fn = float(args.det_hotness_weight_fn)
-    w_fp_a = float(args.det_hotness_weight_fp_a)
-    w_fp_b = float(args.det_hotness_weight_fp_b)
-    total = w_tp * prior_tp + w_fn * prior_fn + w_fp_a * prior_fp_a + w_fp_b * prior_fp_b
-
-    return {
-        'tp': _normalize_01(prior_tp),
-        'fn': _normalize_01(prior_fn),
-        'fp_a': _normalize_01(prior_fp_a),
-        'fp_b': _normalize_01(prior_fp_b),
-        'fp_loc': _normalize_01(prior_fp_a),
-        'fp_cls': _normalize_01(prior_fp_b),
-        'total': _normalize_01(total),
     }
 
 
@@ -532,7 +468,6 @@ def _save_component_gradient_exports(
     inv_transform_test,
     objective_context=None,
     detection_overlay=None,
-    prior_maps=None,
 ):
     if not component_gradients:
         return
@@ -569,7 +504,7 @@ def _save_component_gradient_exports(
         'det_hotness_weight_fp_a': args.det_hotness_weight_fp_a,
         'det_hotness_weight_fp_b': args.det_hotness_weight_fp_b,
         'det_hotness_gate_alpha': args.det_hotness_gate_alpha,
-        'det_hotness_lambda': args.det_hotness_lambda,
+        'det_disable_gated_components': bool(args.det_disable_gated_components),
         'input_saliency_method': args.input_saliency_method,
         'noise_iters': args.noise_iters,
         'noise_percent': args.noise_percent,
@@ -581,14 +516,7 @@ def _save_component_gradient_exports(
     }
 
     for component_name, grads in component_gradients.items():
-        component_prior = None
-        if prior_maps:
-            component_prior = prior_maps.get(component_name)
-        arrays = _prepare_gradient_arrays(
-            grads,
-            prior_map=component_prior,
-            blend_lambda=args.det_hotness_lambda,
-        )
+        arrays = _prepare_gradient_arrays(grads)
         if args.save_npy:
             np.save(os.path.join(raw_dir, f'{save_name}_{component_name}_raw_grad.npy'), arrays['raw_grad'])
             np.save(os.path.join(map_dir, f'{save_name}_{component_name}_abs_map.npy'), arrays['abs_map'])
@@ -607,7 +535,6 @@ def _save_component_gradient_exports(
             'loss_value': float(component_losses.get(component_name, float('nan'))),
             'percentile_low': arrays['percentile_low'],
             'percentile_high': arrays['percentile_high'],
-            'applied_hotness_prior': bool(arrays.get('applied_prior', False)),
             'raw_gradient_path': (
                 os.path.join('raw_gradients', f'{save_name}_{component_name}_raw_grad.npy')
                 if args.save_npy else None
@@ -1272,13 +1199,8 @@ def save_gradients(
     reference_image,
     inv_transform_test,
     detection_overlay=None,
-    prior_map=None,
 ):
-    arrays = _prepare_gradient_arrays(
-        grads_to_save,
-        prior_map=prior_map,
-        blend_lambda=args.det_hotness_lambda,
-    )
+    arrays = _prepare_gradient_arrays(grads_to_save)
     save_path = os.path.join(_per_image_output_dir(args), args.figure_folder_name)
     os.makedirs(save_path, exist_ok=True)
     save_name = _reference_save_name(args)
@@ -1328,11 +1250,18 @@ def compute_detection_component_gradients(
             target_spec,
             objective_context=objective_context,
         )
-        for component_name, loss_tensor in components.items():
+        if args.det_disable_gated_components:
+            components = {
+                name: loss_tensor
+                for name, loss_tensor in components.items()
+                if not name.endswith('_gated')
+            }
+        component_items = list(components.items())
+        for idx, (component_name, loss_tensor) in enumerate(component_items):
             net.zero_grad()
             if perturbed_inputs.grad is not None:
                 perturbed_inputs.grad.zero_()
-            loss_tensor.backward(retain_graph=(component_name != list(components.keys())[-1]))
+            loss_tensor.backward(retain_graph=(idx != len(component_items) - 1))
             component_samples.setdefault(component_name, []).append(perturbed_inputs.grad.detach().cpu().clone())
             component_losses[component_name] = float(loss_tensor.detach().cpu().item())
 
@@ -1656,9 +1585,6 @@ if __name__ == '__main__':
         print(f'Input tensor saved to {input_tensor_path}')
 
     detection_overlay = _build_detection_overlay(reference_image, net, args)
-    prior_maps = {}
-    if detection_overlay is not None and args.task == 'detection' and args.det_objective_mode == 'hotness_unified':
-        prior_maps = _build_hotness_prior_maps(reference_image, detection_overlay, args)
 
     if detection_overlay is not None:
         _save_detection_box_overlays(
@@ -1675,7 +1601,6 @@ if __name__ == '__main__':
         reference_image,
         inv_transform_test,
         detection_overlay=detection_overlay,
-        prior_map=prior_maps.get('total') if prior_maps else None,
     )
     _save_component_gradient_exports(
         component_gradients,
@@ -1685,7 +1610,6 @@ if __name__ == '__main__':
         inv_transform_test,
         objective_context=objective_context,
         detection_overlay=detection_overlay,
-        prior_maps=prior_maps,
     )
 
     fig, ax = plt.subplots(1, 1, figsize=(15, 4))

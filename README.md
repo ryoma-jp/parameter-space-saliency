@@ -71,6 +71,24 @@ Main outputs:
 
 `loss_component_saliency/` is populated for detection task runs that produce component gradients.
 
+#### Detection loss-component images
+
+For detection runs, `loss_component_saliency/images/` stores one input-saliency overlay per decomposed objective term. For example, when `--output_root results/yolox_tiny_custom_model_hotness_auto` and the image key is `000000000139`, the directory contains:
+
+| File | Meaning |
+|------|---------|
+| `input_saliency_heatmap_000000000139_yolox_custom_tp.png` | Saliency for the `tp` term. Highlights pixels that most affect the true-positive loss for correctly matched detections. |
+| `input_saliency_heatmap_000000000139_yolox_custom_tp_gated.png` | Saliency for the gated `tp` term, i.e. after applying the hotness gate $x^{\alpha}$ controlled by `--det_hotness_gate_alpha`. |
+| `input_saliency_heatmap_000000000139_yolox_custom_fn.png` | Saliency for the `fn` term. Highlights pixels that most affect missed ground-truth objects (false negatives). |
+| `input_saliency_heatmap_000000000139_yolox_custom_fn_gated.png` | Saliency for the gated `fn` term after the same $x^{\alpha}$ transform. |
+| `input_saliency_heatmap_000000000139_yolox_custom_fp_a.png` | Saliency for the `fp_a` term. This corresponds to localization/background false positives: predictions that do not match any ground-truth instance strongly enough. |
+| `input_saliency_heatmap_000000000139_yolox_custom_fp_a_gated.png` | Saliency for the gated `fp_a` term after applying $x^{\alpha}$. |
+| `input_saliency_heatmap_000000000139_yolox_custom_fp_b.png` | Saliency for the `fp_b` term. This corresponds to class-confusion false positives: predictions that overlap a ground-truth object but favor the wrong class. |
+| `input_saliency_heatmap_000000000139_yolox_custom_fp_b_gated.png` | Saliency for the gated `fp_b` term after applying $x^{\alpha}$. |
+| `input_saliency_heatmap_000000000139_yolox_custom_total.png` | Saliency for the final combined hotness objective, computed as the weighted sum of the gated component terms (`tp`, `fn`, `fp_a`, `fp_b`). |
+
+The non-gated files show the raw component objective. The `_gated` files show the same component after the non-linear hotness gate, which changes how strongly large component values dominate the final `total` objective. There is no separate `total_gated` image because `total` is already built from the gated component terms.
+
 Large `.npy` artifacts are disabled by default. To enable them, pass `--save_npy`.
 
 When `--save_npy` is enabled, additional files/directories are exported:
