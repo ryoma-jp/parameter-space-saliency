@@ -25,6 +25,16 @@ PREPROCESS_CFG_JSON='{"resize":[416,416],"letterbox":true,"pad_value":114,"chann
 RUN_MODE=${RUN_MODE:-test}
 TEST_MAX_FILES=${TEST_MAX_FILES:-10}
 
+# Resume control.
+# 1: keep existing OUTPUT_ROOT and resume unfinished images only.
+# 0: start fresh by deleting OUTPUT_ROOT.
+RESUME_ENABLED=${RESUME_ENABLED:-1}
+
+# Force reset when RESUME_ENABLED=1.
+# 1: clear OUTPUT_ROOT once before run, then behave as resume-enabled.
+# 0: keep existing results and resume from checkpoints.
+RESUME_RESET=${RESUME_RESET:-0}
+
 # Number of images to process in parallel inside the container.
 # Accepted values:
 #   - <integer> : use this value directly (e.g. 1 = sequential, 2 = two workers)
@@ -36,7 +46,7 @@ PARALLEL_JOBS=${PARALLEL_JOBS:-auto}
 # Safety factor applied when auto-detecting PARALLEL_JOBS.
 # Fraction of free VRAM (after the probe run) considered safe to use for parallel workers.
 # 0.8 = use up to 80 % of the post-probe free VRAM; reduce if OOM occurs.
-GPU_MEMORY_SAFETY=${GPU_MEMORY_SAFETY:-0.8}
+GPU_MEMORY_SAFETY=${GPU_MEMORY_SAFETY:-0.5}
 
 # ---------------------------------------------------------------------------
 # Unified hotness objective settings
@@ -129,8 +139,19 @@ fi
 for method in auto; do
     OUTPUT_ROOT="${OUTPUT_ROOT_BASE}_${method}"
     echo "Running input saliency with method=${method}, det_objective_mode=${DET_OBJECTIVE_MODE}, det_fp_loc_weight=${DET_FP_LOC_WEIGHT}"
-    rm -rf "$OUTPUT_ROOT"
-    mkdir -p "$OUTPUT_ROOT"
+    if [ "$RESUME_ENABLED" = "1" ]; then
+        if [ "$RESUME_RESET" = "1" ]; then
+            echo "Resume mode: reset requested, clearing OUTPUT_ROOT=${OUTPUT_ROOT}"
+            rm -rf "$OUTPUT_ROOT"
+        else
+            echo "Resume mode: enabled, keeping existing OUTPUT_ROOT=${OUTPUT_ROOT}"
+        fi
+        mkdir -p "$OUTPUT_ROOT"
+    else
+        echo "Resume mode: disabled, starting from clean OUTPUT_ROOT=${OUTPUT_ROOT}"
+        rm -rf "$OUTPUT_ROOT"
+        mkdir -p "$OUTPUT_ROOT"
+    fi
 
     docker compose run --rm \
         -e HOME=/work \
@@ -141,6 +162,7 @@ for method in auto; do
         -e OUTPUT_ROOT="$OUTPUT_ROOT" \
         -e RUN_MODE="$RUN_MODE" \
         -e TEST_MAX_FILES="$TEST_MAX_FILES" \
+        -e RESUME_ENABLED="$RESUME_ENABLED" \
         -e PARALLEL_JOBS="$PARALLEL_JOBS" \
         -e GPU_MEMORY_SAFETY="$GPU_MEMORY_SAFETY" \
         -e MODEL_KWARGS_JSON="$MODEL_KWARGS_JSON" \
@@ -193,6 +215,23 @@ for method in auto; do
                     exit 1
                     ;;
             esac
+
+            checkpoint_dir="$OUTPUT_ROOT/.resume_state"
+            mkdir -p "$checkpoint_dir"
+
+            pending_indices=()
+            for ((idx = 0; idx < run_total; idx++)); do
+                idx_padded=$(printf "%08d" "$idx")
+                marker_file="$checkpoint_dir/${idx_padded}.done"
+                if [ "$RESUME_ENABLED" = "1" ] && [ -f "$marker_file" ]; then
+                    continue
+                fi
+                pending_indices+=("$idx")
+            done
+
+            pending_total=${#pending_indices[@]}
+            skipped_total=$((run_total - pending_total))
+            echo "Resume scan: total=${run_total}, pending=${pending_total}, skipped=${skipped_total}"
 
             csv_file="$OUTPUT_ROOT/timing_runtime.csv"
             if [ ! -f "$csv_file" ]; then
@@ -257,10 +296,10 @@ for method in auto; do
             # Auto-detect PARALLEL_JOBS by probing GPU memory on the first image.
             # Skipped when PARALLEL_JOBS is already set to an integer.
             # ---------------------------------------------------------------------------
-            probe_start_idx=0
+            probe_start_pos=0
             run_start_ms=$(date +%s%3N)
 
-            if [ "$PARALLEL_JOBS" = "auto" ]; then
+            if [ "$PARALLEL_JOBS" = "auto" ] && [ "$pending_total" -gt 0 ]; then
                 if ! command -v nvidia-smi > /dev/null 2>&1; then
                     echo "[WARN] nvidia-smi not found; PARALLEL_JOBS auto-detect falling back to 1"
                     PARALLEL_JOBS=1
@@ -283,11 +322,15 @@ for method in auto; do
                     poller_pid=$!
 
                     # Run probe synchronously so VRAM is measured accurately.
-                    probe_image="${image_paths[0]}"
+                    probe_idx="${pending_indices[0]}"
+                    probe_image="${image_paths[$probe_idx]}"
                     probe_start_ms=$(date +%s%3N)
                     run_one_image "$probe_image"
                     probe_end_ms=$(date +%s%3N)
                     probe_elapsed_ms=$((probe_end_ms - probe_start_ms))
+
+                    probe_idx_padded=$(printf "%08d" "$probe_idx")
+                    printf "%s\n" "$probe_image" > "$checkpoint_dir/${probe_idx_padded}.done"
 
                     kill "$poller_pid" 2>/dev/null || true
                     wait "$poller_pid" 2>/dev/null || true
@@ -310,7 +353,7 @@ for method in auto; do
 
                     echo "[$METHOD] GPU probe: total=${gpu_total_mb}MiB baseline=${baseline_mb}MiB peak=${peak_mb}MiB per_image=${per_image_mb}MiB free_after=${free_after_mb}MiB safety=${GPU_MEMORY_SAFETY} → PARALLEL_JOBS=${PARALLEL_JOBS}"
 
-                    # Record probe timing as the CSV entry for image index 1 (0-padded file 00000000).
+                    # Record probe timing as the CSV entry for this image index.
                     probe_ts=$(date -Iseconds)
                     printf "%s,%s,%s,%s,%s,%d,%d,%s,%d,%s,%s,%s,%s\n" \
                         "per_image" \
@@ -318,7 +361,7 @@ for method in auto; do
                         "$(csv_escape "$METHOD")" \
                         "$(csv_escape "$RUN_MODE")" \
                         "$(csv_escape "$OUTPUT_ROOT")" \
-                        1 \
+                        $((probe_idx + 1)) \
                         "$run_total" \
                         "$(csv_escape "$probe_image")" \
                         "$probe_elapsed_ms" \
@@ -326,13 +369,14 @@ for method in auto; do
                         "" \
                         "$(csv_escape "$DET_OBJECTIVE_MODE")" \
                         "$(csv_escape "$METHOD")" \
-                        > "$tmp_dir/00000000.csv"
+                        > "$tmp_dir/${probe_idx_padded}.csv"
 
-                    probe_start_idx=1
+                    probe_start_pos=1
                 fi
             fi
 
-            for ((idx = probe_start_idx; idx < run_total; idx++)); do
+            for ((pos = probe_start_pos; pos < pending_total; pos++)); do
+                idx="${pending_indices[$pos]}"
                 image_path="${image_paths[$idx]}"
                 idx_padded=$(printf "%08d" "$idx")
                 (
@@ -341,6 +385,7 @@ for method in auto; do
                     run_one_image "$image_path"
                     image_end_ms=$(date +%s%3N)
                     image_elapsed_ms=$((image_end_ms - image_start_ms))
+                    printf "%s\n" "$image_path" > "$checkpoint_dir/${idx_padded}.done"
                     image_ts=$(date -Iseconds)
                     echo "[$METHOD][$RUN_MODE] ($((idx + 1))/$run_total) elapsed: ${image_elapsed_ms} ms"
                     printf "%s,%s,%s,%s,%s,%d,%d,%s,%d,%s,%s,%s,%s\n" \
