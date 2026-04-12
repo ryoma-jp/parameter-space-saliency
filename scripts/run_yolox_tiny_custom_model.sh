@@ -46,7 +46,7 @@ PARALLEL_JOBS=${PARALLEL_JOBS:-auto}
 # Safety factor applied when auto-detecting PARALLEL_JOBS.
 # Fraction of free VRAM (after the probe run) considered safe to use for parallel workers.
 # 0.8 = use up to 80 % of the post-probe free VRAM; reduce if OOM occurs.
-GPU_MEMORY_SAFETY=${GPU_MEMORY_SAFETY:-0.5}
+GPU_MEMORY_SAFETY=${GPU_MEMORY_SAFETY:-0.3}
 
 # ---------------------------------------------------------------------------
 # Unified hotness objective settings
@@ -184,6 +184,28 @@ for method in auto; do
         pss \
             bash -lc 'set -euo pipefail
 
+            active_pids=()
+            poller_pid=""
+
+            terminate_all_jobs() {
+                local sig="${1:-TERM}"
+                if [ -n "$poller_pid" ]; then
+                    kill -"$sig" "$poller_pid" 2>/dev/null || true
+                fi
+                for pid in "${active_pids[@]:-}"; do
+                    kill -"$sig" "$pid" 2>/dev/null || true
+                done
+            }
+
+            on_interrupt() {
+                echo "[INFO] interrupt received; stopping running jobs..."
+                terminate_all_jobs TERM
+                terminate_all_jobs KILL
+                exit 130
+            }
+
+            trap on_interrupt INT TERM
+
             if [ ! -d "$IMAGE_DIR" ]; then
                 echo "Missing image directory in container: $IMAGE_DIR"
                 exit 1
@@ -284,15 +306,21 @@ for method in auto; do
             # Temp directory for per-image CSV records; merged in order after all jobs complete.
             tmp_dir=$(mktemp -d)
 
-            # Array of active background job PIDs.
-            active_pids=()
-
-            # Wait for all tracked jobs and clear the list. Emits a warning on any failure.
+            # Wait for all tracked jobs and clear the list.
+            # Returns non-zero when any job fails or is interrupted.
             flush_active_pids() {
+                local status=0
                 for pid in "${active_pids[@]}"; do
-                    wait "$pid" || echo "[WARN] background job (pid=$pid) exited with non-zero status"
+                    if wait "$pid"; then
+                        continue
+                    else
+                        wait_status=$?
+                        [ "$status" -eq 0 ] && status="$wait_status"
+                        echo "[WARN] background job (pid=$pid) exited with non-zero status"
+                    fi
                 done
                 active_pids=()
+                return "$status"
             }
 
             # ---------------------------------------------------------------------------
@@ -337,6 +365,7 @@ for method in auto; do
 
                     kill "$poller_pid" 2>/dev/null || true
                     wait "$poller_pid" 2>/dev/null || true
+                    poller_pid=""
                     peak_mb=$(cat "$peak_file")
                     rm -f "$peak_file"
 
@@ -409,10 +438,10 @@ for method in auto; do
                 ) &
                 active_pids+=("$!")
                 if [ "${#active_pids[@]}" -ge "$PARALLEL_JOBS" ]; then
-                    flush_active_pids
+                    flush_active_pids || exit $?
                 fi
             done
-            flush_active_pids
+            flush_active_pids || exit $?
 
             # Merge per-image records into the CSV file in index order.
             for ((idx = 0; idx < run_total; idx++)); do
