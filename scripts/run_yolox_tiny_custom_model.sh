@@ -41,44 +41,11 @@ RESUME_RESET=${RESUME_RESET:-0}
 # Number of images to process in parallel inside the container.
 # Accepted values:
 #   - <integer> : use this value directly (e.g. 1 = sequential, 2 = two workers)
-#   - auto      : dynamically launch the next job only when current GPU memory
-#                 usage ratio is below GPU_MEMORY_SAFETY.
-# On a single GPU (e.g. RTX 4070 Ti 12 GB), PARALLEL_JOBS=2 is still a safe
-# fixed-mode starting point when auto scheduling is not desired.
-PARALLEL_JOBS=${PARALLEL_JOBS:-auto}
+# Dynamic auto scheduling has been removed from this script.
+PARALLEL_JOBS=${PARALLEL_JOBS:-1}
 
-# Legacy knob kept for backward compatibility. No longer used in dynamic auto
-# scheduling mode.
-AUTO_PROBE_COUNT=${AUTO_PROBE_COUNT:-3}
-
-# Safety threshold for dynamic auto scheduling.
-# New jobs are launched only when gpu_usage_ratio < GPU_MEMORY_SAFETY.
-GPU_MEMORY_SAFETY=${GPU_MEMORY_SAFETY:-0.2}
-
-# Poll interval (seconds) for dynamic auto scheduling.
-# Used only when PARALLEL_JOBS=auto.
+# Poll interval (seconds) while waiting for a worker slot in fixed parallel mode.
 AUTO_LAUNCH_POLL_SEC=${AUTO_LAUNCH_POLL_SEC:-0.2}
-
-# Interval (seconds) for periodic GPU usage logs printed to stdout.
-# Set to 0 to disable periodic logging.
-GPU_USAGE_LOG_INTERVAL_SEC=${GPU_USAGE_LOG_INTERVAL_SEC:-1}
-
-# GPU settle-wait controls after each launched job in auto mode.
-# Wait until usage ratio increases from baseline, then becomes stable.
-AUTO_LAUNCH_SETTLE_MIN_SEC=${AUTO_LAUNCH_SETTLE_MIN_SEC:-1.0}
-AUTO_LAUNCH_SETTLE_EPS=${AUTO_LAUNCH_SETTLE_EPS:-0.01}
-AUTO_LAUNCH_RISE_EPS=${AUTO_LAUNCH_RISE_EPS:-0.01}
-AUTO_LAUNCH_SETTLE_STABLE_COUNT=${AUTO_LAUNCH_SETTLE_STABLE_COUNT:-3}
-
-# Dynamic RAM gating controls for PARALLEL_JOBS=auto.
-# The estimator is updated after each GPU settle point and used to limit
-# active workers by available host RAM inside the container.
-RAM_RESERVE_MB=${RAM_RESERVE_MB:-2048}
-RAM_SAFETY_FACTOR=${RAM_SAFETY_FACTOR:-1.25}
-RAM_EST_ALPHA=${RAM_EST_ALPHA:-0.35}
-RAM_PER_JOB_MIN_MB=${RAM_PER_JOB_MIN_MB:-3000}
-RAM_PER_JOB_MAX_MB=${RAM_PER_JOB_MAX_MB:-8192}
-RAM_DYNAMIC_LOG=${RAM_DYNAMIC_LOG:-1}
 
 # Failure diagnostics for parallel workers.
 # 1: print failed image path, exit code, and per-image log tail
@@ -200,20 +167,7 @@ for method in auto; do
         -e TEST_MAX_FILES="$TEST_MAX_FILES" \
         -e RESUME_ENABLED="$RESUME_ENABLED" \
         -e PARALLEL_JOBS="$PARALLEL_JOBS" \
-        -e AUTO_PROBE_COUNT="$AUTO_PROBE_COUNT" \
-        -e GPU_MEMORY_SAFETY="$GPU_MEMORY_SAFETY" \
         -e AUTO_LAUNCH_POLL_SEC="$AUTO_LAUNCH_POLL_SEC" \
-        -e GPU_USAGE_LOG_INTERVAL_SEC="$GPU_USAGE_LOG_INTERVAL_SEC" \
-        -e AUTO_LAUNCH_SETTLE_MIN_SEC="$AUTO_LAUNCH_SETTLE_MIN_SEC" \
-        -e AUTO_LAUNCH_SETTLE_EPS="$AUTO_LAUNCH_SETTLE_EPS" \
-        -e AUTO_LAUNCH_RISE_EPS="$AUTO_LAUNCH_RISE_EPS" \
-        -e AUTO_LAUNCH_SETTLE_STABLE_COUNT="$AUTO_LAUNCH_SETTLE_STABLE_COUNT" \
-        -e RAM_RESERVE_MB="$RAM_RESERVE_MB" \
-        -e RAM_SAFETY_FACTOR="$RAM_SAFETY_FACTOR" \
-        -e RAM_EST_ALPHA="$RAM_EST_ALPHA" \
-        -e RAM_PER_JOB_MIN_MB="$RAM_PER_JOB_MIN_MB" \
-        -e RAM_PER_JOB_MAX_MB="$RAM_PER_JOB_MAX_MB" \
-        -e RAM_DYNAMIC_LOG="$RAM_DYNAMIC_LOG" \
         -e DEBUG_FAILURE_DIAG="$DEBUG_FAILURE_DIAG" \
         -e MODEL_KWARGS_JSON="$MODEL_KWARGS_JSON" \
         -e PREPROCESS_CFG_JSON="$PREPROCESS_CFG_JSON" \
@@ -238,17 +192,9 @@ for method in auto; do
             set -euo pipefail
 
             active_pids=()
-            poller_pid=""
-            gpu_logger_pid=""
 
             terminate_all_jobs() {
                 local sig="${1:-TERM}"
-                if [ -n "$gpu_logger_pid" ]; then
-                    kill -"$sig" "$gpu_logger_pid" 2>/dev/null || true
-                fi
-                if [ -n "$poller_pid" ]; then
-                    kill -"$sig" "$poller_pid" 2>/dev/null || true
-                fi
                 for pid in "${active_pids[@]:-}"; do
                     kill -"$sig" "$pid" 2>/dev/null || true
                 done
@@ -455,235 +401,29 @@ for method in auto; do
                 active_job_indices=("${next_indices[@]}")
                 return "$status"
             }
+            if [[ "$PARALLEL_JOBS" == "auto" ]]; then
+                echo "[WARN] PARALLEL_JOBS=auto is no longer supported; falling back to 1"
+                PARALLEL_JOBS=1
+            fi
+            if ! [[ "$PARALLEL_JOBS" =~ ^[0-9]+$ ]] || [ "$PARALLEL_JOBS" -le 0 ]; then
+                echo "Invalid PARALLEL_JOBS: $PARALLEL_JOBS"
+                echo "Set PARALLEL_JOBS to a positive integer."
+                exit 1
+            fi
 
-            gpu_memory_usage_ratio() {
-                local total_mb used_mb
-                total_mb=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1 | tr -d " ")
-                used_mb=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1 | tr -d " ")
-                if [ -z "${total_mb:-}" ] || [ "$total_mb" -le 0 ]; then
-                    echo "1.0"
-                    return 0
-                fi
-                awk -v used="$used_mb" -v total="$total_mb" 'BEGIN { printf "%.4f", used / total }'
-            }
-
-            get_mem_total_mb() {
-                awk '/^MemTotal:/ { printf "%d", $2 / 1024 }' /proc/meminfo
-            }
-
-            get_mem_available_mb() {
-                awk '/^MemAvailable:/ { printf "%d", $2 / 1024 }' /proc/meminfo
-            }
-
-            estimate_max_safe_jobs_by_ram() {
-                local available_mb="$1"
-                local safe_jobs
-                safe_jobs=$(awk \
-                    -v avail="$available_mb" \
-                    -v reserve="$RAM_RESERVE_MB" \
-                    -v per_job="$per_job_ram_est_mb" \
-                    -v factor="$RAM_SAFETY_FACTOR" \
-                    'BEGIN {
-                        usable = avail - reserve;
-                        need = per_job * factor;
-                        if (need <= 0) {
-                            print 0;
-                            exit;
-                        }
-                        if (usable <= 0) {
-                            print 0;
-                            exit;
-                        }
-                        jobs = int(usable / need);
-                        if (jobs < 0) jobs = 0;
-                        print jobs;
-                    }')
-                echo "$safe_jobs"
-            }
-
-            update_ram_estimator_after_settle() {
-                local available_mb used_mb active_count raw_est_mb clamped_mb
-                local prev_est_mb next_est_mb safe_jobs
-
-                available_mb=$(get_mem_available_mb)
-                used_mb=$((mem_total_mb - available_mb))
-                active_count=${#active_pids[@]}
-                if [ "$active_count" -le 0 ]; then
-                    return 0
-                fi
-
-                raw_est_mb=$(awk \
-                    -v used="$used_mb" \
-                    -v base="$mem_baseline_used_mb" \
-                    -v jobs="$active_count" \
-                    'BEGIN {
-                        delta = used - base;
-                        if (delta < 0) delta = 0;
-                        if (jobs <= 0) {
-                            print 0;
-                        } else {
-                            printf "%.2f", delta / jobs;
-                        }
-                    }')
-
-                clamped_mb=$(awk \
-                    -v raw="$raw_est_mb" \
-                    -v minv="$RAM_PER_JOB_MIN_MB" \
-                    -v maxv="$RAM_PER_JOB_MAX_MB" \
-                    'BEGIN {
-                        v = raw;
-                        if (v < minv) v = minv;
-                        if (v > maxv) v = maxv;
-                        printf "%.2f", v;
-                    }')
-
-                prev_est_mb="$per_job_ram_est_mb"
-                next_est_mb=$(awk \
-                    -v prev="$prev_est_mb" \
-                    -v cur="$clamped_mb" \
-                    -v alpha="$RAM_EST_ALPHA" \
-                    'BEGIN {
-                        if (alpha < 0) alpha = 0;
-                        if (alpha > 1) alpha = 1;
-                        v = ((1 - alpha) * prev) + (alpha * cur);
-                        if (v < 1) v = 1;
-                        printf "%.2f", v;
-                    }')
-                per_job_ram_est_mb="$next_est_mb"
-
-                safe_jobs=$(estimate_max_safe_jobs_by_ram "$available_mb")
-                if [ "${RAM_DYNAMIC_LOG:-1}" = "1" ]; then
-                    echo "[RAM] available_mb=${available_mb} used_mb=${used_mb} active_jobs=${active_count} raw_per_job_mb=${raw_est_mb} est_per_job_mb=${per_job_ram_est_mb} max_safe_jobs_by_ram=${safe_jobs}"
-                fi
-            }
-
-            start_gpu_usage_logger() {
-                if ! command -v nvidia-smi > /dev/null 2>&1; then
-                    return 0
-                fi
-                if [ "${GPU_USAGE_LOG_INTERVAL_SEC:-1}" = "0" ]; then
-                    return 0
-                fi
-                (
-                    while true; do
-                        ts=$(date -Iseconds)
-                        total_mb=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d " ")
-                        used_mb=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d " ")
-                        if [ -n "${total_mb:-}" ] && [ "$total_mb" -gt 0 ] && [ -n "${used_mb:-}" ]; then
-                            ratio=$(awk -v used="$used_mb" -v total="$total_mb" 'BEGIN { printf "%.4f", used / total }')
-                            echo "[GPU][$ts] usage_ratio=$ratio used_mb=$used_mb total_mb=$total_mb"
-                        fi
-                        sleep "$GPU_USAGE_LOG_INTERVAL_SEC"
-                    done
-                ) &
-                gpu_logger_pid=$!
-            }
-
-            wait_for_gpu_usage_settle() {
-                local baseline_ratio="${1:-0}"
-                local start_ms now_ms elapsed_ms
-                local min_ms
-                local prev_ratio cur_ratio delta is_stable
-                local stable_hits=0
-                local seen_rise=0
-                local rose_enough=0
-
-                min_ms=$(awk -v s="$AUTO_LAUNCH_SETTLE_MIN_SEC" 'BEGIN { printf "%d", s * 1000 }')
-
-                prev_ratio=$(gpu_memory_usage_ratio)
-                start_ms=$(date +%s%3N)
-
-                while true; do
-                    sleep "$AUTO_LAUNCH_POLL_SEC"
-                    reap_finished_pids || return $?
-
-                    cur_ratio=$(gpu_memory_usage_ratio)
-                    delta=$(awk -v a="$cur_ratio" -v b="$prev_ratio" 'BEGIN { d = a - b; if (d < 0) d = -d; printf "%.4f", d }')
-                    is_stable=$(awk -v d="$delta" -v eps="$AUTO_LAUNCH_SETTLE_EPS" 'BEGIN { print (d <= eps ? 1 : 0) }')
-                    rose_enough=$(awk -v cur="$cur_ratio" -v base="$baseline_ratio" -v eps="$AUTO_LAUNCH_RISE_EPS" 'BEGIN { print ((cur - base) >= eps ? 1 : 0) }')
-
-                    if [ "$rose_enough" -eq 1 ]; then
-                        seen_rise=1
-                    fi
-
-                    if [ "$seen_rise" -eq 1 ] && [ "$is_stable" -eq 1 ]; then
-                        stable_hits=$((stable_hits + 1))
-                    else
-                        stable_hits=0
-                    fi
-
-                    now_ms=$(date +%s%3N)
-                    elapsed_ms=$((now_ms - start_ms))
-
-                    if [ "$elapsed_ms" -ge "$min_ms" ] && [ "$seen_rise" -eq 1 ] && [ "$stable_hits" -ge "$AUTO_LAUNCH_SETTLE_STABLE_COUNT" ]; then
-                        break
-                    fi
-
-                    prev_ratio="$cur_ratio"
-                done
-            }
-
-            # ---------------------------------------------------------------------------
-            # Dynamic scheduler for PARALLEL_JOBS=auto.
-            # Launch a new job only when current GPU memory usage ratio is below
-            # GPU_MEMORY_SAFETY. Integer PARALLEL_JOBS keeps fixed parallel mode.
-            # ---------------------------------------------------------------------------
-            dynamic_auto_mode=0
             run_start_ms=$(date +%s%3N)
-            mem_total_mb=$(get_mem_total_mb)
-            mem_available_mb=$(get_mem_available_mb)
-            mem_baseline_used_mb=$((mem_total_mb - mem_available_mb))
-            per_job_ram_est_mb="$RAM_PER_JOB_MIN_MB"
-
-            if [ "${RAM_DYNAMIC_LOG:-1}" = "1" ]; then
-                echo "[RAM] init total_mb=${mem_total_mb} available_mb=${mem_available_mb} baseline_used_mb=${mem_baseline_used_mb} est_per_job_mb=${per_job_ram_est_mb} reserve_mb=${RAM_RESERVE_MB} safety_factor=${RAM_SAFETY_FACTOR}"
-            fi
-
-            if [ "$PARALLEL_JOBS" = "auto" ] && [ "$pending_total" -gt 0 ]; then
-                if ! command -v nvidia-smi > /dev/null 2>&1; then
-                    echo "[WARN] nvidia-smi not found; PARALLEL_JOBS=auto falls back to fixed 1"
-                    PARALLEL_JOBS=1
-                else
-                    dynamic_auto_mode=1
-                    echo "[$METHOD] PARALLEL_JOBS=auto: dynamic launch enabled (gpu_usage_ratio < ${GPU_MEMORY_SAFETY})"
-                fi
-            fi
-
-            start_gpu_usage_logger
 
             for ((pos = 0; pos < pending_total; pos++)); do
                 idx="${pending_indices[$pos]}"
                 image_path="${image_paths[$idx]}"
                 idx_padded=$(printf "%08d" "$idx")
 
-                if [ "$dynamic_auto_mode" = "1" ]; then
-                    while true; do
-                        reap_finished_pids || exit $?
-                        usage_ratio=$(gpu_memory_usage_ratio)
-                        mem_available_mb=$(get_mem_available_mb)
-                        max_safe_jobs_by_ram=$(estimate_max_safe_jobs_by_ram "$mem_available_mb")
-                        can_launch=$(awk -v usage="$usage_ratio" -v safety="$GPU_MEMORY_SAFETY" 'BEGIN { print (usage < safety ? 1 : 0) }')
-                        can_launch_ram=$(awk -v active="${#active_pids[@]}" -v cap="$max_safe_jobs_by_ram" 'BEGIN { print (active < cap ? 1 : 0) }')
-                        if [ "$can_launch" -eq 1 ] && [ "$can_launch_ram" -eq 1 ]; then
-                            break
-                        fi
-                        if [ "${#active_pids[@]}" -eq 0 ] && [ "$can_launch" -eq 0 ] && [ "$can_launch_ram" -eq 1 ]; then
-                            echo "[WARN] gpu_usage_ratio=${usage_ratio} >= safety=${GPU_MEMORY_SAFETY} but no active jobs; forcing launch"
-                            break
-                        fi
-                        if [ "${RAM_DYNAMIC_LOG:-1}" = "1" ] && [ "$can_launch_ram" -ne 1 ]; then
-                            echo "[RAM] gating launch: available_mb=${mem_available_mb} max_safe_jobs_by_ram=${max_safe_jobs_by_ram} active_jobs=${#active_pids[@]} est_per_job_mb=${per_job_ram_est_mb}"
-                        fi
+                while [ "${#active_pids[@]}" -ge "$PARALLEL_JOBS" ]; do
+                    reap_finished_pids || exit $?
+                    if [ "${#active_pids[@]}" -ge "$PARALLEL_JOBS" ]; then
                         sleep "$AUTO_LAUNCH_POLL_SEC"
-                    done
-                else
-                    while [ "${#active_pids[@]}" -ge "$PARALLEL_JOBS" ]; do
-                        reap_finished_pids || exit $?
-                        if [ "${#active_pids[@]}" -ge "$PARALLEL_JOBS" ]; then
-                            sleep "$AUTO_LAUNCH_POLL_SEC"
-                        fi
-                    done
-                fi
+                    fi
+                done
 
                 launch_ts=$(date -Iseconds)
                 echo "[$METHOD][$RUN_MODE][$launch_ts] launching job idx=$((idx + 1))/$run_total path=${image_path} active_before=${#active_pids[@]}"
@@ -719,19 +459,8 @@ for method in auto; do
                 active_pids+=("$!")
                 active_job_images+=("$image_path")
                 active_job_indices+=("$idx_padded")
-
-                if [ "$dynamic_auto_mode" = "1" ]; then
-                    wait_for_gpu_usage_settle "$usage_ratio" || exit $?
-                    update_ram_estimator_after_settle || exit $?
-                fi
             done
             flush_active_pids || exit $?
-
-            if [ -n "$gpu_logger_pid" ]; then
-                kill "$gpu_logger_pid" 2>/dev/null || true
-                wait "$gpu_logger_pid" 2>/dev/null || true
-                gpu_logger_pid=""
-            fi
 
             # Merge per-image records into the CSV file in index order.
             for ((idx = 0; idx < run_total; idx++)); do

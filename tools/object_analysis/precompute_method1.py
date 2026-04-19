@@ -15,6 +15,7 @@ object_catalog.json をフラット化し、集計CSVを生成する（方式1: 
 """
 
 import json
+import argparse
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -23,9 +24,7 @@ from pathlib import Path
 # Paths
 # ---------------------------------------------------------------------------
 ROOT = Path(__file__).resolve().parents[2]
-CATALOG_PATH = ROOT / "results/yolox_tiny_custom_model_auto/object_catalog.json"
-OUT_AGG = ROOT / "results/yolox_tiny_custom_model_auto/aggregates"
-OUT_ANALYSIS = ROOT / "results/yolox_tiny_custom_model_auto/analysis"
+DEFAULT_RESULTS_ROOT = Path("results/yolox_tiny_custom_model_auto")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -69,18 +68,38 @@ def safe_div(num: float, denom: float) -> float:
     return num / denom if denom != 0 else float("nan")
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Flatten object_catalog.json and generate aggregate CSVs"
+    )
+    parser.add_argument(
+        "--results_root",
+        type=Path,
+        default=DEFAULT_RESULTS_ROOT,
+        help="Root directory containing object_catalog.json",
+    )
+    return parser.parse_args()
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main() -> None:
-    OUT_AGG.mkdir(parents=True, exist_ok=True)
-    OUT_ANALYSIS.mkdir(parents=True, exist_ok=True)
+    args = parse_args()
+
+    catalog_path = ROOT / args.results_root / "object_catalog.json"
+    out_agg = ROOT / args.results_root / "aggregates"
+    out_analysis = ROOT / args.results_root / "analysis"
+
+    out_agg.mkdir(parents=True, exist_ok=True)
+    out_analysis.mkdir(parents=True, exist_ok=True)
 
     # -----------------------------------------------------------------------
     # 1. JSON ロード
     # -----------------------------------------------------------------------
+    print(f"Using results_root: {args.results_root}")
     print("Loading object_catalog.json ...")
-    with open(CATALOG_PATH) as f:
+    with open(catalog_path) as f:
         data = json.load(f)
     df = pd.DataFrame(data)
     print(f"  Records : {len(df):,}")
@@ -129,7 +148,7 @@ def main() -> None:
     # -----------------------------------------------------------------------
     # 3. objects_flat.csv 出力
     # -----------------------------------------------------------------------
-    flat_path = OUT_AGG / "objects_flat.csv"
+    flat_path = out_agg / "objects_flat.csv"
     df.to_csv(flat_path, index=False)
     print(f"\nSaved: {flat_path}  ({len(df):,} rows)")
 
@@ -171,7 +190,7 @@ def main() -> None:
         .sort_values("f1", ascending=False)
         .reset_index(drop=True)
     )
-    cm_path = OUT_AGG / "class_metrics.csv"
+    cm_path = out_agg / "class_metrics.csv"
     cm_df.to_csv(cm_path, index=False)
     print(f"Saved: {cm_path}  ({len(cm_df)} classes)")
 
@@ -199,7 +218,7 @@ def main() -> None:
         )
 
     sb_df = pd.DataFrame(sb_rows)
-    sb_path = OUT_AGG / "size_band_metrics.csv"
+    sb_path = out_agg / "size_band_metrics.csv"
     sb_df.to_csv(sb_path, index=False)
     print(f"Saved: {sb_path}")
     print(sb_df.to_string(index=False))
@@ -227,7 +246,7 @@ def main() -> None:
             )
 
     feat_df = pd.DataFrame(feat_rows)
-    feat_path = OUT_ANALYSIS / "feature_stats.csv"
+    feat_path = out_analysis / "feature_stats.csv"
     feat_df.to_csv(feat_path, index=False)
     print(f"Saved: {feat_path}")
 

@@ -69,7 +69,7 @@ echo ""
 echo "=== Step 2: Generating aggregated CSVs ==="
 docker compose run "${DOCKER_COMMON_OPTS[@]}" pss \
     bash -lc 'set -euo pipefail
-    python3 tools/object_analysis/precompute_method1.py'
+    python3 tools/object_analysis/precompute_method1.py --results_root "$RESULTS_ROOT"'
 
 # ---------------------------------------------------------------------------
 # Step 3: EDA Notebook 生成
