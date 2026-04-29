@@ -102,11 +102,6 @@ DET_HOTNESS_WEIGHT_FP_B=${DET_HOTNESS_WEIGHT_FP_B:-1.0}
 # Increasing alpha suppresses low-loss contributions more aggressively and strengthens TP suppression.
 DET_HOTNESS_GATE_ALPHA=${DET_HOTNESS_GATE_ALPHA:-1.0}
 
-# Disable gated component maps when set to 1.
-# 0: export gradients/images for tp_gated/fn_gated/fp_a_gated/fp_b_gated (legacy behavior)
-# 1: skip gated component gradients and gated PNG exports
-DET_DISABLE_GATED_COMPONENTS=${DET_DISABLE_GATED_COMPONENTS:-1}
-
 # Behavior for images with no GT annotation.
 # Using fp_loc_only makes empty images behave as FP-A-dominant cases.
 DET_EMPTY_GT_POLICY=fp_loc_only
@@ -184,7 +179,6 @@ for method in auto; do
         -e DET_HOTNESS_WEIGHT_FP_A="$DET_HOTNESS_WEIGHT_FP_A" \
         -e DET_HOTNESS_WEIGHT_FP_B="$DET_HOTNESS_WEIGHT_FP_B" \
         -e DET_HOTNESS_GATE_ALPHA="$DET_HOTNESS_GATE_ALPHA" \
-        -e DET_DISABLE_GATED_COMPONENTS="$DET_DISABLE_GATED_COMPONENTS" \
         -e DET_EMPTY_GT_POLICY="$DET_EMPTY_GT_POLICY" \
         -e METHOD="$method" \
         pss \
@@ -274,10 +268,6 @@ for method in auto; do
             # ---------------------------------------------------------------------------
             run_one_image() {
                 local img="$1"
-                local gated_flag=()
-                if [ "${DET_DISABLE_GATED_COMPONENTS:-0}" = "1" ]; then
-                    gated_flag+=(--det_disable_gated_components)
-                fi
                 python3 parameter_and_input_saliency.py \
                     --task detection \
                     --model_source custom_module \
@@ -300,7 +290,6 @@ for method in auto; do
                         --det_hotness_weight_fp_a "$DET_HOTNESS_WEIGHT_FP_A" \
                         --det_hotness_weight_fp_b "$DET_HOTNESS_WEIGHT_FP_B" \
                         --det_hotness_gate_alpha "$DET_HOTNESS_GATE_ALPHA" \
-                        "${gated_flag[@]}" \
                     --det_empty_gt_policy "$DET_EMPTY_GT_POLICY" \
                     --input_saliency_method "$METHOD" \
                     --target_type true_label
