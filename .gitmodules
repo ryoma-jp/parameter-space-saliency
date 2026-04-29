@@ -1,3 +1,6 @@
 [submodule "externals/YOLOX"]
 	path = externals/YOLOX
 	url = https://github.com/ryoma-jp/YOLOX.git
+[submodule ".github"]
+	path = .github
+	url = https://github.com/ryoma-jp/copilot-assets.git
