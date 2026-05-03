@@ -6,12 +6,22 @@ Conventional saliency maps highlight input features to which neural network pred
 
 Getting started
 ---------------
+
+This workspace is intended to run with Docker Compose.
+Python dependencies are installed in the container image from `requirements.txt` during `docker compose build`.
+
 ```
 $ ./scripts/make_env.sh
-$ docker-compose build
-$ docker-compose up -d
-$ docker-compose exec pss bash
+$ docker compose build
+$ docker compose up -d
+$ docker compose exec pss bash
 # cd /work
+```
+
+If you update `requirements.txt` or `Dockerfile`, rebuild the image:
+
+```bash
+docker compose build --no-cache pss
 ```
 
 Basic Use
