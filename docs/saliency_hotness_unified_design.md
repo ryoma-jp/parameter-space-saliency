@@ -1,349 +1,228 @@
-# FP/FNをHOTにし、TPをHOTにしない可視化: PSS準拠の統合設計
+# FP/FNをHOTにし、TPをHOTにしない可視化: PSS論文準拠の物体検知拡張設計
 
 ## 目的
 
-本設計の目的は以下を同時に満たすことである。
+本設計の目的は次を同時に満たすこと。
 
 - FP/FNをHOTにする
 - TPをHOTにしない
 
-ここでのHOTは、主にフィルタ単位サリエンシーで寄与が強いことを指し、この寄与度を入力空間へ投影して可視化する。
+ここでHOTは、フィルタ単位サリエンシー（Filter Saliency）が異常に高い状態を指す。
 
 ---
 
-## 前提の原理
+## 論文確認結果（PSSの原式）
 
-本設計は、PSS（Parameter Space Saliency Maps, arXiv:2108.01335）の原理に従う。
+arXiv:2108.01335 の主定義は以下。
 
-- 一次指標は入力勾配 $\partial L/\partial x$ ではなく、パラメータ勾配 $\partial L/\partial \theta$
-- まず重み単位サリエンシーを計算する
-- 次に重みをフィルタ単位へ統合して Filter Saliency を得る
-- 最終的な目的「FP/FN HOT・TP non-HOT」は、この Filter Saliency の合成重みで制御する
+1. パラメータ単位サリエンシー
+
+$$
+s(x,y)_i := \left|\nabla_{\theta_i}\mathcal{L}_{\theta}(x,y)\right|
+$$
+
+2. フィルタ単位集約（filter-wise average）
+
+$$
+\bar{s}(x,y)_f := \frac{1}{|\alpha_f|}\sum_{i\in\alpha_f} s(x,y)_i
+$$
+
+3. データセット基準の標準化
+
+$$
+\hat{s}(x,y) := \frac{\bar{s}(x,y)-\mu}{\sigma}
+$$
+
+- $\mu,\sigma$ は比較基準集合 $D$ 上の filter-wise saliency の平均と標準偏差
+- 論文では「Lossゲート $g(L)$ の乗算」は導入していない
+
+したがって、本拡張でも主計算は「勾配絶対値→フィルタ平均→標準化」を維持する。
 
 ---
 
-## 対象の4分類
+## 物体検知向け拡張の基本方針
 
-本設計では、検出結果を以下の4タイプへ分離して扱う。
+### 1. 推論結果を4タイプに分類
 
-1. TP
-- 正しい位置かつ正しいクラス
+- TP: 正しい位置かつ正しいクラス
+- FN: GTがあるのに未検出
+- FP-A: GTがない領域への誤検知（位置型FP）
+- FP-B: GTと重なるがクラス誤り（クラス混同型FP）
 
-2. FN
-- GTがあるのに未検出
+### 2. 物体単位Total LossでPSSを計算
 
-3. FP-A
-- GTがない領域に物体を検出（位置型FP）
-
-4. FP-B
-- GTがある領域に物体を検出するがクラス誤分類（クラス混同型FP）
-
----
-
-## 統合スコアの基本方針
-
-単純な勾配だけでは目的を満たしにくいため、物体単位LossとLossゲートを導入し、重み単位からフィルタ単位へ統合する。
-
-### 1. 物体単位Loss
-
-各タイプ・各物体 $k$ に対して個別Lossを定義する。
-
-- TP: $L_k^{tp}$
-- FN: $L_k^{fn}$
-- FP-A: $L_k^{fpA}$
-- FP-B: $L_k^{fpB}$
-
-要件:
-
-- 望ましい状態では小さく、問題状態では大きくなる
-- 画像平均Lossではなく、物体単位Lossを基本とする
-
-### 2. Loss重み付き重みサリエンシー（PSSの主計算）
-
-パラメータ $\theta_j$ に対する物体 $k$ の重みサリエンシーを次で定義する。
+画像全体Lossではなく、各物体 $k$ ごとに detector の通常損失項から Total Loss を定義する。
 
 $$
-S_{k,j}^{param} = g(L_k)\,h\!\left(\frac{\partial L_k}{\partial \theta_j}\right)
+L_k^{total} = L_{k}^{cls} + \lambda_{obj}L_{k}^{obj} + \lambda_{box}L_{k}^{box} + \lambda_{aux}L_{k}^{aux}
 $$
 
-- $g(L_k)$: Loss大きさのゲート関数（単調増加）
-- $h(\cdot)$: 勾配変換（推奨初期値は $h(z)=|z|$）
+- 各項は採用検出器の既存定義に従う（検出器ごとに項の有無・係数が異なる）
+- 新規の独自罰則を主計算に混ぜず、まず論文準拠の勾配定義を優先する
+- $\lambda_{aux}L_k^{aux}$ は補助的な正則化損失の汎用プレースホルダ（検出器に存在しない場合は0とする）
 
-意図:
+> **例: YOLOX の Total Loss**（`yolox/models/yolo_head.py` L.403–404）
+>
+> $$L^{total} = 5.0\,L_{iou} + L_{obj} + L_{cls} + L_{l1}$$
+>
+> | 項 | 対応 |
+> |---|---|
+> | $\lambda_{box}L^{box}$ | $5.0\,L_{iou}$（IoU Loss） |
+> | $\lambda_{obj}L^{obj}$ | $L_{obj}$（BCE objectness, $\lambda=1$） |
+> | $L^{cls}$ | $L_{cls}$（BCE classification） |
+> | $\lambda_{aux}L^{aux}$ | $L_{l1}$（L1 box regression, ウォームアップ後に有効） |
 
-- TPで「Loss小・勾配大」の場合でも $g(L_k)$ が小さく、寄与を抑制
-- FN/FPで「Loss大・勾配中程度」でも $g(L_k)$ が寄与を増幅
-
-### 3. Filter Saliency への統合
-
-フィルタ $f$ に属するパラメータ集合を $\Theta_f$ とすると、物体 $k$ のFilter Saliencyを
+物体 $k$ の parameter-wise saliency を
 
 $$
-S_{k,f}^{filter} = \operatorname{Agg}_{j\in\Theta_f} \; S_{k,j}^{param}
+s_k(i) := \left|\frac{\partial L_k^{total}}{\partial \theta_i}\right|
+$$
+
+として計算する。
+
+> **FN 物体の Loss 計算について**
+> FN は予測 bbox が存在しないため、検出器の通常 forward パスでは $L_k^{total}$ が直接得られない。
+> 以下のいずれかで代替する（実装時に選択・固定する）。
+>
+> 1. **近傍割り当て方式**: GT bbox と最も IoU が高い anchor/grid cell の損失をそのまま $L_k^{fn}$ とする
+> 2. **GT 位置強制方式**: GT bbox 座標・クラスを擬似予測として入力し、detector の損失関数に通す
+>
+> どちらの方式を選ぶかは実験ログに明記し、比較実験では統一すること。
+
+### 3. 物体単位Filter Saliency
+
+フィルタ $f$ の添字集合を $\alpha_f$ として、物体 $k$ の filter-wise saliency を
+
+$$
+\bar{s}_{k,f} := \frac{1}{|\alpha_f|}\sum_{i\in\alpha_f} s_k(i)
 $$
 
 で定義する。
 
-実装推奨:
+---
 
-- Conv重みではチャネル・空間次元で平均（mean of abs-grad）
-- `signed`解析時のみ符号付き平均を使う
+## 標準化（TP基準）
+
+本拡張での最重要修正点は、標準化統計をTP集合から推定すること。
+
+TP物体集合を $\mathcal{T}_{tp}$ とし、各フィルタ $f$ について
+
+$$
+\mu^{tp}_f = \frac{1}{|\mathcal{T}_{tp}|}\sum_{k\in\mathcal{T}_{tp}} \bar{s}_{k,f}
+$$
+
+$$
+\sigma^{tp}_f = \mathrm{Std}_{k\in\mathcal{T}_{tp}}\left[\bar{s}_{k,f}\right]
+$$
+
+と置き、全タイプに対して
+
+$$
+\hat{s}_{k,f} = \frac{\bar{s}_{k,f}-\mu^{tp}_f}{\sigma^{tp}_f+\epsilon}
+$$
+
+を用いる。
+
+これにより、TPを「正常ベースライン」とした異常度として HOT を定義できる。
 
 ---
 
-## タイプ別Lossの設計
+## 入力空間への投影（論文準拠）
 
-### TP
+### 論文の定式（Section 2.2）
 
-- Loss: 低いほど良い（通常ほぼ0）
-- 期待挙動: 非HOT
+標準化サリエンシー $\hat{s}(x,y)$ を出発点として、次の2ステップで入力空間マップを生成する。
 
-### FN
+**ステップ1: Boosted Saliency Profile の構成**
 
-- Loss: GT物体の未検出度を表す（大きいほど悪い）
-- 期待挙動: HOT
+注目するフィルタ集合 $F$（上位 $|F|$ フィルタ）を選び、そのエントリのみを係数 $k$ で強調した参照プロファイルを作る。
 
-### FP-A（位置型FP）
+$$
+\bigl(s'_F\bigr)_f =
+\begin{cases}
+\hat{s}_f, & f \notin F,\\
+k\,\hat{s}_f, & f \in F
+\end{cases}
+\quad (k > 1,\; \text{論文デフォルト } k=100)
+$$
 
-- Loss: GT非対応高信頼予測を罰する項
-- 期待挙動: HOT
+**ステップ2: 入力空間マップの計算**
 
-### FP-B（クラス混同型FP）
+「現在の $\hat{s}(x,y)$ を $s'_F$ に近づける方向の入力勾配の絶対値」を入力空間サリエンシーマップとする。
 
-- Loss: GT重なり予測で誤クラス優勢を罰する項
-- 期待挙動: HOT
+$$
+M_F = \left|\nabla_x\, D_C\!\bigl(\hat{s}(x,y),\, s'_F\bigr)\right|
+$$
 
-例（概念）:
+- $D_C(\cdot,\cdot)$: コサイン距離
+- $M_F$: フィルタ集合 $F$ を誤動作させている入力ピクセルのマップ
 
-- $L_k^{fpB}=\max(0, s_{wrong,k}-s_{gt,k}+m)$
+### 物体検知への適用方針
+
+各物体 $k$ の標準化サリエンシー $\hat{s}_{k}$（全フィルタのベクトル）に対して上記を適用する。
+
+1. 物体 $k$ ごとに $\hat{s}_k$ を計算する（TP基準で標準化済み）
+2. FN / FP-A / FP-B 物体について、それぞれ上位 $|F|$ フィルタを選ぶ
+3. $s'_F$ を構成し、$M_{F,k}=\left|\nabla_x D_C(\hat{s}_k, s'_{F,k})\right|$ を計算する
+4. 複数物体のマップを重ねる場合は $M_F^{agg}=\sum_k M_{F,k}$ で合算する
+
+TP 物体は $\hat{s}$ が標準化後に低いため $s'_F$ との乖離が小さく、自然に目立たない。 FN/FP 物体は標準化後に高い $\hat{s}$ をもち、入力マップにも強く現れる。
+
+### 実装上の注意
+
+- $F$ の選び方: 物体 $k$ ごとに $\hat{s}_{k}$ の上位 $|F|$ フィルタ（論文では $|F|=10$）
+- $k$ の値: 論文デフォルト $100$、可視化のコントラストに応じて調整可
+- 主指標はあくまで $\hat{s}_{k,f}$（パラメータ空間）、$M_F$ は補助的な入力空間可視化
+- **二階微分について**: $\nabla_x D_C(\hat{s}(x,y), s'_F)$ は $\hat{s}(x,y) = \bar{s}(x,y)/\sigma^{tp}+\mathrm{const}$ が $x \to \mathcal{L} \to \nabla_\theta \mathcal{L}$ を経由して $x$ に依存するため、入力勾配の計算に `create_graph=True` が必要（論文実装も同様）
 
 ---
 
-## 最終Filter Saliency合成
-
-タイプ別・物体別Filter Saliencyを重み付き合成する。
-
-$$
-S_f^{final} =
-w_{fn}\sum_k S_{k,f}^{fn}
-+ w_{fpA}\sum_k S_{k,f}^{fpA}
-+ w_{fpB}\sum_k S_{k,f}^{fpB}
-+ w_{tp}\sum_k S_{k,f}^{tp}
-$$
-
-推奨初期値:
-
-- $w_{tp}=0$（または極小）
-- $w_{fn}>0,\; w_{fpA}>0,\; w_{fpB}>0$
-
-これにより、設計仕様として TP非HOT を明示的に担保できる。
-
----
-
-## 入力空間可視化との関係（補助出力）
-
-入力空間ヒートマップが必要な場合は、Filter Saliencyを入力空間へ投影して作成する。
-
-$$
-S^{img}(x) = \sum_f S_f^{final}\,R_f(x)
-$$
-
-- $R_f(x)$: フィルタ $f$ に対応する入力空間への寄与マップ（活性ベースまたは勾配ベース）
-
-注意:
-
-- 本設計の主原理は $\partial L/\partial\theta$ であり、$\partial L/\partial x$ は補助的な投影手段
-
----
-
-## 目的適合性の確認表
-
-| タイプ | Loss大きさ | 重み/フィルタサリエンシー（本設計） |
-|---|---:|---:|
-| TP | 小 | 非HOT（抑制） |
-| FN | 大 | HOT |
-| FP-A | 大 | HOT |
-| FP-B | 大 | HOT |
-
----
-
-## 実装上の指針
-
-- 画像単位平均より先に、必ず物体単位Lossを定義する
-- サリエンシーは $\partial L/\partial\theta$ を基本とし、$g(L)$ で重み付けする
-- Filter統合（aggregation）を固定し、比較時は同条件を維持する
-- 最終合成で $w_{tp}=0$ または極小を維持する
-
----
-
-## まとめ
-
-本統合様式は、TP/FN/FP-A/FP-Bを分離しつつ同一フレームで扱える。
-その上で、PSS原理に従って「物体単位Loss → 重みサリエンシー（$\partial L/\partial\theta$）→ Filter統合」を行うことで、
-「FP/FNをHOTにする、TPをHOTにしない」を設計レベルで実現する。
-
----
-
-## 設計詳細（実装用）
-
-### A. 物体単位Lossの具体化
-
-以下は実装時の基準形である。係数はデータセットに応じて調整する。
-
-1. TP
-
-$$
-L_k^{tp} = -\log(s_{gt,k}+\epsilon)
-$$
-
-- $s_{gt,k}$ は物体 $k$ に対応する正解クラススコア
-- 既に正しく検出できているTPでは小さい
-
-2. FN
-
-$$
-L_k^{fn} = -\log(\text{covered\_score}_k+\epsilon)
-$$
-
-- covered_score はGT物体 $k$ に対応する検出カバレッジ
-- 未検出ほど小さく、Lossは大きい
-
-3. FP-A（位置型FP）
-
-$$
-L_k^{fpA} = (s_{pred,k})^p, \quad k \in \{\mathrm{IoU}(pred,GT)<\tau_{loc}\}
-$$
-
-- GT非対応の高信頼予測を直接罰する
-
-4. FP-B（クラス混同型FP）
-
-$$
-L_k^{fpB} = \max(0, s_{wrong,k} - s_{gt,k} + m)
-$$
-
-- GTと重なる予測のうち、誤クラス優勢を罰する
-- $m$ はマージン（通常 0.05-0.2）
-
-### B. Lossゲート関数 $g(L)$
-
-TP抑制とFP/FN強調の要である。初期導入は以下の2択が扱いやすい。
-
-1. べき乗ゲート
-
-$$
-g(L)=L^{\alpha}, \quad \alpha \in [0.5,2.0]
-$$
-
-2. シグモイドゲート
-
-$$
-g(L)=\sigma(\beta(L-c))
-$$
-
-- $c$: 強調開始しきい値
-- $\beta$: 立ち上がりの鋭さ
-
-運用指針:
-
-- TPが残る場合は $c$ を上げる、または $\alpha$ を上げる
-- FP/FNが消える場合は $c$ を下げる、または $\alpha$ を下げる
-
-### C. Filter統合（Aggregation）
-
-実装比較の再現性を保つため、統合方法を固定する。
-
-1. `filter_wise`（推奨）
-
-- Conv重み（4D）に対し、入力チャネル・カーネル次元で平均
-- 既定は絶対値平均（abs-mean）
-
-2. `parameter_wise`
-
-- すべての重みをフラット化して直接比較
-- デバッグ用途で有効
-
-### D. 推奨初期ハイパーパラメータ
-
-- $w_{tp}=0.0$
-- $w_{fn}=1.0$, $w_{fpA}=1.0$, $w_{fpB}=1.0$
-- $\tau_{loc}=0.3$（FP-A判定）
-- $m=0.1$（FP-Bマージン）
-- $\epsilon=1e-8$
-- $g(L)=L^{1.0}$ から開始
-- aggregation: `filter_wise`
-- signed: `false`（abs-grad）
-
-### E. 推論時の処理フロー（擬似コード）
+## 推論時フロー（更新版）
 
 ```text
 for each image:
-	detect predictions and match with GT
-	split instances into TP, FN, FP-A, FP-B
+    run detection and match prediction/GT
+    split objects into TP, FN, FP-A, FP-B
 
-	for each instance k in each type t:
-		compute object-wise loss L_k^t
-		compute parameter gradient dL_k^t/dtheta
-		S_param[k, j] = g(L_k^t) * abs(dL_k^t/dtheta_j)
-		S_filter[k, f] = aggregate_over_filter(S_param[k, :])
+    for each object k:
+        compute detector-native object total loss L_k_total
+        compute parameter gradient abs: s_k(i)=|dL_k_total/dtheta_i|
+        aggregate to filter-wise saliency: s_bar[k,f]
 
-	S_final_filter[f] = w_fn  * sum_k S_filter_fn[k, f]
-						 + w_fpA * sum_k S_filter_fpA[k, f]
-						 + w_fpB * sum_k S_filter_fpB[k, f]
-						 + w_tp  * sum_k S_filter_tp[k, f]
+accumulate TP objects from calibration split
+compute mu_tp[f], sigma_tp[f] from TP filter saliency only
 
-	(optional) project S_final_filter to image-space for visualization
+for each object k (all types):
+    z-score normalize by TP stats: s_hat[k,f]
+    # s_hat[k,f] ≈ 0 for TP by construction; large positive for FN/FP
+
+# --- input-space projection (optional, per object k) ---
+# requires second-order grad: retain computation graph through loss -> grad_theta -> s_bar
+for each object k in FN/FP-A/FP-B:
+    select top-|F| filters by s_hat[k,:]        # e.g. |F|=10
+    build s_prime_F: s_hat[k,f] * k if f in F, else s_hat[k,f]  # k=100
+    M_F_k = |grad_x cosine_distance(s_hat[k,:], s_prime_F)|  # s_hat as fn of x
+M_F_agg = sum over k of M_F_k                   # per-image input saliency map
 ```
 
-### F. 評価プロトコル（目的適合性の定量化）
+---
 
-目的は「FP/FN HOT, TP non-HOT」であるため、まずFilter空間で評価し、必要に応じて入力空間指標を併記する。
+## 実装指針（本改訂で固定すること）
 
-1. Type-Hotness Ratio in Filter Space (FHR)
+- PSS主計算は論文どおり $|\partial L/\partial\theta|$ と filter-wise mean を使う
+- 独自ゲート関数 $g(L)$ は主計算から外す
+- 物体単位Total Lossは detector の既存損失項で構成する
+- 標準化の $\mu,\sigma$ は TP物体の Filter Saliency から計算する
+- 比較実験では、同一の TP基準統計（同一split・同一seed）を使い回す
 
-$$
-\mathrm{FHR}_t = \frac{1}{N_t}\sum_{k\in t}\frac{1}{|\mathcal{F}|}\sum_{f\in\mathcal{F}}\mathbb{1}[S_{k,f}^{filter}>q_f]
-$$
+---
 
-- $q_f$: フィルタサリエンシーの分位しきい値（例: 上位10%）
+## 目的適合性の確認
 
-期待値:
+TP基準の標準化後、以下を満たすことを確認する。
 
-- FHR_FN, FHR_FP-A, FHR_FP-B は高い
-- FHR_TP は低い
+- TP群の平均 $\hat{s}$ が低い
+- FN / FP-A / FP-B 群の平均 $\hat{s}$ が TP より高い
+- フィルタ上位分位の占有率が TP < FN/FP
 
-2. Contrast Score
-
-$$
-C_{err/tp}=\frac{\operatorname{mean}(S^{filter}\mid FN,FP)}{\operatorname{mean}(S^{filter}\mid TP)+\epsilon}
-$$
-
-- $C_{err/tp}>1$ を維持する
-
-3. 検証手順
-
-- 同一画像集合でハイパーパラメータを固定比較
-- 乱数seed固定
-- TP抑制失敗時はゲートと $w_{tp}$ を優先調整
-
-### G. よくある失敗と対処
-
-1. TPが依然HOT
-
-- 原因: $w_{tp}$ が非ゼロ、または $g(L)$ の閾値が低すぎる
-- 対処: $w_{tp}=0$ を固定、$c$ または $\alpha$ を増加
-
-2. FNが弱い
-
-- 原因: FN用Lossの設計が弱く、$L_k^{fn}$ が十分に立たない
-- 対処: covered_score定義を見直し、$w_{fn}$ またはゲート強度を増加
-
-3. FP-Bが弱い
-
-- 原因: 位置FP項のみでクラス混同を直接罰していない
-- 対処: $L_k^{fpB}$ を有効化し、$w_{fpB}$ を増加
-
-4. 全体がノイジー
-
-- 原因: 勾配スケールの画像間差、またはaggregation条件の不一致
-- 対処: abs-grad基準を固定し、比較時のaggregation/signed設定を統一
+これにより、「FP/FNをHOT、TPをnon-HOT」という要件を、PSS論文準拠の枠組みで実現する。
