@@ -116,6 +116,279 @@ class YOLOXOfficialLossProvider(DetectionObjectiveProvider):
                 mod.train(training_flags[id(mod)])
 
 
+    @contextmanager
+    def _training_forward_mode(self, model: nn.Module):
+        modules = list(model.modules())
+        training_flags = {id(mod): mod.training for mod in modules}
+        try:
+            model.train()
+            for mod in modules:
+                if isinstance(mod, batchnorm._BatchNorm):
+                    mod.eval()
+            yield
+        finally:
+            for mod in modules:
+                mod.train(training_flags[id(mod)])
+
+
+class YOLOXPerObjectProvider(DetectionObjectiveProvider):
+    """Compute per-object (per-GT) losses using YOLOX SimOTA assignment.
+
+    Returns a dict with keys 'tp', 'fp_b', 'fp_a', 'fn', each a list of
+    scalar loss Tensors (backprop-able). FN uses SimOTA re-run on free anchors.
+    None entries in 'fn' indicate unresolvable FN GTs (e.g. fully occluded).
+    """
+
+    name = 'yolox_per_object'
+
+    def supports(self, model: nn.Module, context: Dict[str, Any]) -> bool:
+        base_model = model.module if isinstance(model, nn.DataParallel) else model
+        return hasattr(base_model, 'head') and hasattr(getattr(base_model, 'head'), 'get_per_object_losses')
+
+    def build_objective(
+        self,
+        model: nn.Module,
+        inputs: torch.Tensor,
+        gt_instances: List[Dict[str, torch.Tensor]],
+        context: Dict[str, Any],
+    ) -> torch.Tensor:
+        per_obj = self.build_per_object_losses(model, inputs, gt_instances, context)
+        all_losses: List[torch.Tensor] = []
+        for key in ('tp', 'fp_a', 'fp_b', 'fn'):
+            for item in per_obj[key]:
+                if item is not None:
+                    all_losses.append(item)
+        if not all_losses:
+            from task_adapter.detection import DetectionTaskAdapter
+            return inputs.sum() * 0.0
+        return torch.stack(all_losses).mean()
+
+    def build_per_object_losses(
+        self,
+        model: nn.Module,
+        inputs: torch.Tensor,
+        gt_instances: List[Dict[str, torch.Tensor]],
+        context: Dict[str, Any],
+    ) -> Dict[str, list]:
+        """Return per-object loss dicts for Stage1 saliency computation.
+
+        Structure:
+            {
+              'tp':   List[Tensor scalar],  one per TP GT (paired pred anchor)
+              'fp_b': List[Tensor scalar],  one per FP-B pred (class-confusion)
+              'fp_a': List[Tensor scalar],  one per FP-A pred (wrong location)
+              'fn':   List[Optional[Tensor scalar]],  one per FN GT; None = unresolvable
+              'classification': dict with 'tp_pairs', 'fp_cls_pairs', 'fp_loc_pred_indices', 'fn_gt_indices'
+            }
+        Only batch_idx=0 is supported (single-image inference).
+        """
+        match_iou = float(context.get('det_match_iou_threshold', 0.5))
+        conf_threshold = float(context.get('det_conf_threshold', 0.3))
+        nms_iou_threshold = float(context.get('det_nms_iou_threshold', 0.45))
+        tau_fn = float(context.get('det_fn_tau', 0.1))
+
+        labels = YOLOXOfficialLossProvider()._build_yolox_labels(inputs, gt_instances)
+
+        # Run training-mode forward to get raw head outputs + shifts
+        base_model = model.module if isinstance(model, nn.DataParallel) else model
+        head = base_model.head
+
+        # Collect raw forward outputs (training mode) and shifts
+        outputs_list, origin_preds, x_shifts, y_shifts, expanded_strides = [], [], [], [], []
+        with YOLOXOfficialLossProvider()._training_forward_mode(model):
+            # We need to replicate the forward logic to get x_shifts etc.
+            # Use head directly via _run_head_training
+            for k, (cls_conv, reg_conv, stride_this_level, x) in enumerate(
+                zip(head.cls_convs, head.reg_convs, head.strides, base_model.backbone(inputs) if hasattr(base_model, 'backbone') else self._get_fpn_features(base_model, inputs))
+            ):
+                x = head.stems[k](x)
+                cls_feat = head.cls_convs[k](x)
+                cls_output = head.cls_preds[k](cls_feat)
+                reg_feat = head.reg_convs[k](x)
+                reg_output = head.reg_preds[k](reg_feat)
+                obj_output = head.obj_preds[k](reg_feat)
+
+                output, grid = head.get_output_and_grid(
+                    torch.cat([reg_output, obj_output, cls_output], 1),
+                    k, stride_this_level, inputs.type(),
+                )
+                x_shifts.append(grid[:, :, 0])
+                y_shifts.append(grid[:, :, 1])
+                expanded_strides.append(
+                    torch.zeros(1, grid.shape[1]).fill_(stride_this_level).type_as(inputs)
+                )
+                if head.use_l1:
+                    bs, _, hsize, wsize = reg_output.shape
+                    reg_out_l1 = reg_output.view(bs, 1, 4, hsize, wsize)
+                    reg_out_l1 = reg_out_l1.permute(0, 1, 3, 4, 2).reshape(bs, -1, 4)
+                    origin_preds.append(reg_out_l1.clone())
+                outputs_list.append(output)
+
+        raw_outputs = torch.cat(outputs_list, 1)  # (B, n_anchors, 5+C)
+
+        # Normal SimOTA: get per-GT losses for TP/FP-B (assigned anchors)
+        per_obj_result = head.get_per_object_losses(
+            inputs, x_shifts, y_shifts, expanded_strides,
+            labels, raw_outputs, origin_preds, dtype=inputs.dtype,
+        )
+
+        # Inference-mode forward for NMS-based FP-A/FP-B classification
+        prev_training = model.training
+        with torch.no_grad():
+            model.eval()
+            infer_outputs = model(inputs)
+            model.train(prev_training)
+
+        batch_idx = 0
+        gt_item = gt_instances[batch_idx]
+        gt_classes = gt_item['class_ids'].to(device=inputs.device, dtype=torch.long)
+        gt_boxes   = gt_item['boxes_xyxy'].to(device=inputs.device, dtype=inputs.dtype)
+
+        # NMS on inference outputs
+        obj_s  = infer_outputs[batch_idx, :, 4:5]
+        cls_s  = infer_outputs[batch_idx, :, 5:]
+        scores_2d = (obj_s * cls_s)
+        pred_best_scores, pred_best_cls_ids = scores_2d.max(dim=1)
+        conf_mask = pred_best_scores >= conf_threshold
+
+        pred_boxes_all = DetectionTaskAdapter._cxcywh_to_xyxy(infer_outputs[batch_idx, :, :4])
+        if conf_mask.sum() > 0:
+            kept_boxes  = pred_boxes_all[conf_mask]
+            kept_cls    = pred_best_cls_ids[conf_mask]
+            kept_scores = pred_best_scores[conf_mask]
+            keep_idx    = DetectionTaskAdapter._nms_indices_by_class(
+                kept_boxes, kept_cls, kept_scores, nms_iou_threshold
+            )
+            nms_boxes   = kept_boxes[keep_idx]
+            nms_cls     = kept_cls[keep_idx]
+            nms_scores  = kept_scores[keep_idx]
+        else:
+            nms_boxes  = pred_boxes_all.new_zeros((0, 4))
+            nms_cls    = gt_classes.new_zeros((0,))
+            nms_scores = pred_best_scores.new_zeros((0,))
+
+        from task_adapter.detection import DetectionTaskAdapter as _DTA
+        classification = _DTA._classify_instances(
+            _DTA.__new__(_DTA),
+            nms_boxes, nms_cls, nms_scores,
+            gt_boxes, gt_classes,
+            iou_threshold=match_iou,
+        )
+
+        result_tp:   List[torch.Tensor]          = []
+        result_fp_b: List[torch.Tensor]          = []
+        result_fp_a: List[torch.Tensor]          = []
+        result_fn:   List[Optional[torch.Tensor]] = []
+
+        # TP: per-GT loss from SimOTA result
+        simota = per_obj_result[batch_idx]
+        if simota is not None:
+            per_gt_losses = simota['per_gt_losses']
+            for pidx, gt_idx in classification['tp_pairs']:
+                loss_k = per_gt_losses[gt_idx]
+                result_tp.append(loss_k)
+
+            # FP-B: use per-gt loss of the GT they overlap with
+            for pidx, gt_idx in classification['fp_cls_pairs']:
+                # Use the loss of the mis-matched GT anchor set as proxy signal
+                loss_k = per_gt_losses[gt_idx]
+                result_fp_b.append(loss_k)
+
+            # FP-A: per-anchor total loss for NMS-surviving FP-A anchors
+            # Map NMS box back to raw anchor index by closest box match
+            fp_a_losses = self._compute_fp_a_losses(
+                raw_outputs, classification['fp_loc_pred_indices'],
+                nms_boxes, simota['fg_mask'], head,
+                x_shifts, y_shifts, expanded_strides,
+                origin_preds if head.use_l1 else None,
+                batch_idx,
+            )
+            result_fp_a = fp_a_losses
+
+            # FN: SimOTA re-run on free anchors
+            fn_gt_inds = classification['fn_gt_indices']
+            if fn_gt_inds:
+                gt_boxes_cxcywh = gt_item['boxes_cxcywh'].to(device=inputs.device, dtype=inputs.dtype)
+                fn_losses = head.compute_fn_losses(
+                    batch_idx=batch_idx,
+                    fn_gt_indices=fn_gt_inds,
+                    gt_bboxes_per_image=gt_boxes_cxcywh[:len(gt_classes)],
+                    gt_classes=gt_classes,
+                    outputs=raw_outputs,
+                    x_shifts=x_shifts,
+                    y_shifts=y_shifts,
+                    expanded_strides=expanded_strides,
+                    origin_preds=origin_preds if head.use_l1 else None,
+                    fg_mask=simota['fg_mask'],
+                    tau_fn=tau_fn,
+                )
+                result_fn = fn_losses
+
+        return {
+            'tp':   result_tp,
+            'fp_b': result_fp_b,
+            'fp_a': result_fp_a,
+            'fn':   result_fn,
+            'classification': classification,
+        }
+
+    def _get_fpn_features(self, base_model: nn.Module, inputs: torch.Tensor):
+        """Extract FPN features from a YOLOX model."""
+        fpn_outs = base_model.neck(base_model.backbone(inputs)) if hasattr(base_model, 'neck') else base_model.backbone(inputs)
+        return fpn_outs
+
+    def _compute_fp_a_losses(
+        self,
+        raw_outputs: torch.Tensor,
+        fp_a_nms_indices: List[int],
+        nms_boxes: torch.Tensor,
+        fg_mask: torch.Tensor,
+        head,
+        x_shifts, y_shifts, expanded_strides,
+        origin_preds,
+        batch_idx: int,
+    ) -> List[torch.Tensor]:
+        """Compute per-FP-A object loss.
+
+        FP-A predictions are NMS survivors with no matching GT.
+        For each NMS-surviving FP-A box, find the closest raw anchor and compute
+        its detector loss with objectness target=0 (suppress it).
+        """
+        if not fp_a_nms_indices:
+            return []
+
+        x_shifts_cat         = torch.cat(x_shifts, 1)[0]
+        y_shifts_cat         = torch.cat(y_shifts, 1)[0]
+        expanded_strides_cat = torch.cat(expanded_strides, 1)[0]
+
+        bbox_preds = raw_outputs[batch_idx, :, :4]   # (n_anchors, 4) decoded cxcywh
+        obj_preds  = raw_outputs[batch_idx, :, 4:5]  # (n_anchors, 1)
+        cls_preds  = raw_outputs[batch_idx, :, 5:]   # (n_anchors, n_cls)
+
+        losses = []
+        for nms_local_idx in fp_a_nms_indices:
+            if nms_local_idx >= nms_boxes.shape[0]:
+                continue
+            fp_box_xyxy = nms_boxes[nms_local_idx]   # (4,) xyxy
+            fp_cx = (fp_box_xyxy[0] + fp_box_xyxy[2]) / 2.0
+            fp_cy = (fp_box_xyxy[1] + fp_box_xyxy[3]) / 2.0
+
+            # Anchor centres
+            anchor_cx = (x_shifts_cat + 0.5) * expanded_strides_cat
+            anchor_cy = (y_shifts_cat + 0.5) * expanded_strides_cat
+            dists = (anchor_cx - fp_cx) ** 2 + (anchor_cy - fp_cy) ** 2
+            anchor_idx = int(dists.argmin().item())
+
+            # Objectness suppression loss (target=0 means suppress)
+            obj_target = torch.zeros(1, 1, device=raw_outputs.device, dtype=raw_outputs.dtype)
+            loss_obj = head.bcewithlog_loss(
+                obj_preds[anchor_idx:anchor_idx+1], obj_target
+            ).sum()
+            losses.append(loss_obj)
+
+        return losses
+
+
 class DetectionTaskAdapter(TaskAdapter):
     """Task adapter for object detection models that output (B, N, 5 + C).
 
@@ -138,6 +411,7 @@ class DetectionTaskAdapter(TaskAdapter):
         self.provider_strict = provider_strict
         self._providers: Dict[str, DetectionObjectiveProvider] = {
             YOLOXOfficialLossProvider.name: YOLOXOfficialLossProvider(),
+            YOLOXPerObjectProvider.name: YOLOXPerObjectProvider(),
         }
 
     def _classify_instances(
@@ -215,117 +489,6 @@ class DetectionTaskAdapter(TaskAdapter):
             'fp_cls_pairs': fp_cls_pairs,
             'fp_loc_pred_indices': fp_loc_pred_indices,
             'fn_gt_indices': fn_gt_indices,
-        }
-
-    def _build_hotness_unified_components(
-        self,
-        outputs: torch.Tensor,
-        gt_instances: List[Dict[str, torch.Tensor]],
-        context: Dict[str, Any],
-    ) -> Dict[str, torch.Tensor]:
-        eps = 1e-8
-        match_iou = float(context.get('det_match_iou_threshold', 0.5))
-        fp_loc_score_power = float(context.get('det_fp_loc_score_power', 1.0))
-        fp_cls_margin = float(context.get('det_fp_cls_margin', 0.1))
-
-        w_tp = float(context.get('det_hotness_weight_tp', 0.0))
-        w_fn = float(context.get('det_hotness_weight_fn', 1.0))
-        w_fp_a = float(context.get('det_hotness_weight_fp_a', 1.0))
-        w_fp_b = float(context.get('det_hotness_weight_fp_b', 1.0))
-        gate_alpha = float(context.get('det_hotness_gate_alpha', 1.0))
-
-        obj = outputs[:, :, 4:5]
-        cls = outputs[:, :, 5:]
-        pred_scores = obj * cls
-        pred_best_scores, pred_best_cls_ids = pred_scores.max(dim=2)
-        pred_boxes = self._cxcywh_to_xyxy(outputs[:, :, :4])
-
-        tp_per_image: List[torch.Tensor] = []
-        fn_per_image: List[torch.Tensor] = []
-        fp_a_per_image: List[torch.Tensor] = []
-        fp_b_per_image: List[torch.Tensor] = []
-
-        for bidx in range(outputs.size(0)):
-            gt_item = gt_instances[bidx]
-            gt_classes = gt_item['class_ids'].to(device=outputs.device, dtype=torch.long)
-            gt_boxes = gt_item['boxes_xyxy'].to(device=outputs.device, dtype=outputs.dtype)
-
-            class_split = self._classify_instances(
-                pred_boxes[bidx],
-                pred_best_cls_ids[bidx],
-                pred_best_scores[bidx],
-                gt_boxes,
-                gt_classes,
-                iou_threshold=match_iou,
-            )
-
-            tp_losses = []
-            for pidx, gt_idx in class_split['tp_pairs']:
-                cls_id = int(gt_classes[gt_idx].item())
-                s_gt = pred_scores[bidx, pidx, cls_id].clamp_min(eps)
-                tp_losses.append(-torch.log(s_gt))
-            tp_loss = torch.stack(tp_losses).mean() if tp_losses else self._zero_loss_like(outputs)
-
-            fn_losses = []
-            for gt_idx in class_split['fn_gt_indices']:
-                cls_id = int(gt_classes[gt_idx].item())
-                cls_scores = pred_scores[bidx, :, cls_id].clamp_min(eps)
-                ious = self._box_iou_xyxy_vec(pred_boxes[bidx], gt_boxes[gt_idx])
-                logits = 3.0 * ious + 1.0 * torch.log(cls_scores)
-                weights = torch.softmax(logits, dim=0)
-                covered_score = torch.sum(weights * cls_scores)
-                fn_losses.append(-torch.log(covered_score.clamp_min(eps)))
-            fn_loss = torch.stack(fn_losses).mean() if fn_losses else self._zero_loss_like(outputs)
-
-            fp_a_losses = []
-            for pidx in class_split['fp_loc_pred_indices']:
-                fp_a_losses.append(torch.pow(pred_best_scores[bidx, pidx].clamp_min(eps), fp_loc_score_power))
-            fp_a_loss = torch.stack(fp_a_losses).mean() if fp_a_losses else self._zero_loss_like(outputs)
-
-            fp_b_losses = []
-            for pidx, gt_idx in class_split['fp_cls_pairs']:
-                gt_cls_id = int(gt_classes[gt_idx].item())
-                gt_score = pred_scores[bidx, pidx, gt_cls_id]
-                cls_row = pred_scores[bidx, pidx]
-                wrong_mask = torch.ones_like(cls_row, dtype=torch.bool)
-                wrong_mask[gt_cls_id] = False
-                if wrong_mask.any():
-                    wrong_score = cls_row[wrong_mask].max()
-                    fp_b_losses.append(torch.clamp(wrong_score - gt_score + fp_cls_margin, min=0.0))
-            fp_b_loss = torch.stack(fp_b_losses).mean() if fp_b_losses else self._zero_loss_like(outputs)
-
-            tp_per_image.append(tp_loss)
-            fn_per_image.append(fn_loss)
-            fp_a_per_image.append(fp_a_loss)
-            fp_b_per_image.append(fp_b_loss)
-
-        tp = torch.stack(tp_per_image).mean()
-        fn = torch.stack(fn_per_image).mean()
-        fp_a = torch.stack(fp_a_per_image).mean()
-        fp_b = torch.stack(fp_b_per_image).mean()
-
-        gated_tp = torch.pow(tp.clamp_min(eps), gate_alpha)
-        gated_fn = torch.pow(fn.clamp_min(eps), gate_alpha)
-        gated_fp_a = torch.pow(fp_a.clamp_min(eps), gate_alpha)
-        gated_fp_b = torch.pow(fp_b.clamp_min(eps), gate_alpha)
-
-        total = (
-            w_tp * gated_tp
-            + w_fn * gated_fn
-            + w_fp_a * gated_fp_a
-            + w_fp_b * gated_fp_b
-        )
-
-        return {
-            'tp': tp,
-            'fn': fn,
-            'fp_a': fp_a,
-            'fp_b': fp_b,
-            'tp_gated': gated_tp,
-            'fn_gated': gated_fn,
-            'fp_a_gated': gated_fp_a,
-            'fp_b_gated': gated_fp_b,
-            'total': total,
         }
 
     def _resolve_target_classes(
@@ -640,15 +803,6 @@ class DetectionTaskAdapter(TaskAdapter):
                 "det_gt_instances is required for detection objective modes other than 'legacy_single_class'."
             )
 
-        if objective_mode == 'hotness_unified':
-            outputs = model(inputs)
-            if outputs.ndim != 3 or outputs.size(-1) < 6:
-                raise ValueError(
-                    'DetectionTaskAdapter expects model outputs shaped as (B, N, 5 + C).'
-                )
-            components = self._build_hotness_unified_components(outputs, gt_instances, context)
-            return components['total'], self._resolve_targets_from_gt(gt_instances, true_labels)
-
         det_has_gt = bool(context.get('det_has_gt', True))
         if not det_has_gt:
             outputs = model(inputs)
@@ -688,7 +842,7 @@ class DetectionTaskAdapter(TaskAdapter):
         else:
             raise ValueError(
                 f"Unknown detection objective mode: '{objective_mode}'. "
-                "Choose 'gt_all_instances', 'gt_all_classes', 'hotness_unified', or 'legacy_single_class'."
+                "Choose 'gt_all_instances', 'gt_all_classes', or 'legacy_single_class'."
             )
         if fp_loc_weight > 0.0:
             loss = loss + fp_loc_weight * self._build_fp_loc_objective(outputs, gt_instances, context)
@@ -729,17 +883,7 @@ class DetectionTaskAdapter(TaskAdapter):
                 raise ValueError(
                     'DetectionTaskAdapter expects model outputs shaped as (B, N, 5 + C).'
                 )
-            if objective_mode == 'hotness_unified':
-                return self._build_hotness_unified_components(outputs, gt_instances, context)
             return self._build_empty_gt_components(outputs, gt_instances, context)
-
-        if objective_mode == 'hotness_unified':
-            outputs = model(inputs)
-            if outputs.ndim != 3 or outputs.size(-1) < 6:
-                raise ValueError(
-                    'DetectionTaskAdapter expects model outputs shaped as (B, N, 5 + C).'
-                )
-            return self._build_hotness_unified_components(outputs, gt_instances, context)
 
         provider = self._resolve_provider(model, context)
         if provider is not None:

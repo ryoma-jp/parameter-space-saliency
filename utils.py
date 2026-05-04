@@ -197,8 +197,9 @@ def save_image_IN(inputs, target_class, predicted_class, folder_name, figure_nam
 
 
 def show_heatmap_on_image(img, mask):
-    """both img and mask should be between 0,1"""
+    """both img and mask should be between 0,1. img must be RGB order."""
     heatmap = cv2.applyColorMap(np.uint8(255 * mask), cv2.COLORMAP_JET)
+    heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)  # BGR→RGB to match img
     heatmap = np.float32(heatmap) / 255
     cam = heatmap + np.float32(img)
     cam = cam / np.max(cam)

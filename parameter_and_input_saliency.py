@@ -108,6 +108,8 @@ parser.add_argument('--det_nms_iou_threshold', default=0.45, type=float,
                     help='NMS IoU threshold for detection overlay')
 parser.add_argument('--det_match_iou_threshold', default=0.5, type=float,
                     help='IoU threshold for TP/FP matching against GT')
+parser.add_argument('--det_fn_tau', default=0.1, type=float,
+                    help='minimum IoU threshold used by FN SimOTA re-run in Stage1/Stage2 pipeline')
 parser.add_argument('--det_objective_mode',
                     default='gt_all_instances',
                     choices=['gt_all_instances', 'gt_all_classes', 'hotness_unified', 'legacy_single_class'],
@@ -153,6 +155,34 @@ parser.add_argument('--input_saliency_method',
                 help='how to compute input-space saliency gradients: '
                     'matching (original PSS), direct_loss (dL/dx), or auto '
                     '(classification=matching, detection=direct_loss)')
+
+# ----- Unified pipeline entry (Stage1/Stage2/Stage3) -----
+parser.add_argument('--pipeline_stage',
+                    default='none',
+                    choices=['none', 'stage1', 'stage2', 'stage3'],
+                    help='run a dedicated pipeline stage from this unified entrypoint')
+parser.add_argument('--run_dir', default=None, type=str,
+                    help='pipeline root directory used by stage1/stage2/stage3')
+parser.add_argument('--pipeline_image_dir', default=None, type=str,
+                    help='image directory used by stage2 projection')
+
+# Stage2 options
+parser.add_argument('--stage2_phase', default='all', choices=['all', '2a', '2b'],
+                    help='stage2 phase selection')
+parser.add_argument('--stage2_no_projection', action='store_true',
+                    help='stage2: skip input-space projection')
+parser.add_argument('--stage2_top_f', type=int, default=10,
+                    help='stage2: top-|F| filters used for projection')
+parser.add_argument('--stage2_boost_k', type=float, default=100.0,
+                    help='stage2: boost factor k for top-|F| filters')
+parser.add_argument('--stage2_norm_eps', type=float, default=1e-8,
+                    help='stage2: epsilon for z-score normalization')
+
+# Stage3 options
+parser.add_argument('--stage3_hist_bins', type=int, default=50,
+                    help='stage3: histogram bins')
+parser.add_argument('--stage3_hist_clip', type=float, default=10.0,
+                    help='stage3: histogram clip range [-clip, clip]')
 
 def _cache_key(args) -> str:
     """Derive a filesystem-safe cache key from model arguments."""
@@ -1138,6 +1168,18 @@ if __name__ == '__main__':
 
     if args.logit or args.logit_difference:
         raise NotImplementedError('--logit and --logit_difference are not yet implemented.')
+
+    if args.pipeline_stage != 'none':
+        if args.pipeline_stage == 'stage1':
+            from parameter_saliency.stage1_filter_saliency import run_stage1_filter_saliency
+            run_stage1_filter_saliency(args)
+        elif args.pipeline_stage == 'stage2':
+            from parameter_saliency.stage2_normalize_project import run_stage2_normalize_project
+            run_stage2_normalize_project(args)
+        elif args.pipeline_stage == 'stage3':
+            from parameter_saliency.stage3_statistics import run_stage3_statistics
+            run_stage3_statistics(args)
+        raise SystemExit(0)
 
     os.makedirs(args.output_root, exist_ok=True)
 

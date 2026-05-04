@@ -1,5 +1,5 @@
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.autograd as autograd
@@ -181,6 +181,74 @@ def find_testset_saliency(net, testset, aggregation, task_adapter, target_spec, 
     print('Shape: ', testset_mean_abs_grad.shape)
 
     return testset_mean_abs_grad, testset_std_abs_grad
+
+
+def _aggregate_filter_wise(gradients, signed: bool = False) -> torch.Tensor:
+    """Aggregate parameter gradients into filter-wise saliency vector."""
+    filter_grads = []
+    for grad in gradients:
+        if grad is None:
+            continue
+        if len(grad.size()) == 4:   # Conv2d weight (out, in, kH, kW)
+            if signed:
+                agg = grad.mean(-1).mean(-1).mean(-1)
+            else:
+                agg = grad.abs().mean(-1).mean(-1).mean(-1)
+            filter_grads.append(agg)
+    if not filter_grads:
+        return torch.zeros(0)
+    return torch.cat(filter_grads)
+
+
+def compute_per_object_filter_saliency(
+    model: nn.Module,
+    per_object_losses: Dict[str, list],
+    create_graph: bool = False,
+    signed: bool = False,
+) -> Dict[str, list]:
+    """Compute filter-wise saliency for each per-object loss scalar.
+
+    Args:
+        model:               The model whose parameters are differentiated.
+        per_object_losses:   Dict with keys 'tp', 'fp_a', 'fp_b', 'fn',
+                             each a list of scalar Tensors (or None for FN).
+        create_graph:        If True, retain computation graph for second-order
+                             gradient (needed for Stage2 input-space projection).
+        signed:              Keep gradient sign when True.
+
+    Returns:
+        Dict with same keys, each value a list of Tensor(F,) or None.
+        F = total number of Conv2d output filters across the model.
+    """
+    result: Dict[str, list] = {}
+    total_grad_calls = sum(
+        1
+        for key in ('tp', 'fp_a', 'fp_b', 'fn')
+        for loss_k in per_object_losses.get(key, [])
+        if loss_k is not None
+    )
+    grad_calls_done = 0
+    for key in ('tp', 'fp_a', 'fp_b', 'fn'):
+        losses = per_object_losses.get(key, [])
+        saliencies = []
+        for loss_k in losses:
+            if loss_k is None:
+                saliencies.append(None)
+                continue
+            model.zero_grad()
+            retain_graph = create_graph or (grad_calls_done < total_grad_calls - 1)
+            grads = autograd.grad(
+                loss_k,
+                model.parameters(),
+                create_graph=create_graph,
+                retain_graph=retain_graph,
+                allow_unused=True,
+            )
+            grad_calls_done += 1
+            sal_k = _aggregate_filter_wise(grads, signed=signed)
+            saliencies.append(sal_k)
+        result[key] = saliencies
+    return result
 
 
 if __name__ == '__main__':
