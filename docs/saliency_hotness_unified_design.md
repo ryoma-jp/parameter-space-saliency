@@ -82,12 +82,37 @@ $$
 
 > **FN 物体の Loss 計算について**
 > FN は予測 bbox が存在しないため、検出器の通常 forward パスでは $L_k^{total}$ が直接得られない。
-> 以下のいずれかで代替する（実装時に選択・固定する）。
+> **SimOTA 再実行方式（free anchor 限定）** を採用する。
 >
-> 1. **近傍割り当て方式**: GT bbox と最も IoU が高い anchor/grid cell の損失をそのまま $L_k^{fn}$ とする
-> 2. **GT 位置強制方式**: GT bbox 座標・クラスを擬似予測として入力し、detector の損失関数に通す
+> #### SimOTA 再実行方式
 >
-> どちらの方式を選ぶかは実験ログに明記し、比較実験では統一すること。
+> 通常の SimOTA 実行後に得られる `fg_mask`（割り当て済みanchor）を除外したうえで、FN GT $k$ に対して SimOTA の cost matrix と dynamic-k 選択を再実行し、割り当てられた free anchor に対して Loss を計算する。
+>
+> ```text
+> # 通常の SimOTA 実行済み（fg_mask が確定している前提）
+> for each FN GT k:
+>     candidate_anchors = all_anchors excluding fg_mask
+>     compute pair_wise_ious(GT_k, candidate_anchors)
+>     compute cost_matrix(GT_k, candidate_anchors)  # same formula as SimOTA
+>     dynamic_k = estimate_dynamic_k(pair_wise_ious)
+>     if dynamic_k == 0 or max_iou < tau_fn:
+>         skip GT k (mark as "unresolvable FN", log it)
+>     else:
+>         fn_anchors_k = top-dynamic_k anchors by cost (lowest cost)
+>         # 複数 FN GT が同一 free anchor を選んだ場合は cost 最小の GT のみに帰属
+>         L_k_fn = sum of detector-native loss over fn_anchors_k
+> ```
+>
+> **この方式の根拠**: SimOTA の cost matrix は「このanchorがこのGTを検出するコスト」そのものであり、競合がなければ学習時に割り当てられたはずの anchor を選ぶことになる。その anchor への勾配は「GT $k$ を正しく検出するためにパラメータがどう変わるべきか」を正しく指す。
+>
+> **成立しないケースと対処**:
+>
+> | 状況 | 対処 |
+> |---|---|
+> | geometry constraint 内に free anchor がゼロ（密集・完全オクルージョン） | 計算対象から除外してログに記録 |
+> | free anchor との最大 IoU $< \tau_{fn}$（極小・画像端物体） | 同上 |
+>
+> $\tau_{fn}$ は初期値 $0.1$、比較実験では固定する。
 
 ### 3. 物体単位Filter Saliency
 
@@ -184,9 +209,22 @@ for each image:
     run detection and match prediction/GT
     split objects into TP, FN, FP-A, FP-B
 
-    for each object k:
+    # --- TP / FP-A / FP-B: use detector-native loss directly ---
+    for each object k in TP, FP-A, FP-B:
         compute detector-native object total loss L_k_total
         compute parameter gradient abs: s_k(i)=|dL_k_total/dtheta_i|
+        aggregate to filter-wise saliency: s_bar[k,f]
+
+    # --- FN: SimOTA re-run on free anchors ---
+    for each FN GT k:
+        candidate_anchors = all_anchors excluding fg_mask
+        rerun SimOTA cost matrix and dynamic-k on candidate_anchors
+        if dynamic_k == 0 or max_iou < tau_fn:
+            skip (log as unresolvable FN)
+            continue
+        resolve conflicts: each free anchor assigned to at most one FN GT (lowest cost wins)
+        L_k_fn = detector-native loss over fn_anchors_k
+        compute s_k(i)=|dL_k_fn/dtheta_i|
         aggregate to filter-wise saliency: s_bar[k,f]
 
 accumulate TP objects from calibration split
