@@ -194,14 +194,20 @@ def _normalize_01(arr: np.ndarray) -> np.ndarray:
     return ((arr - arr_min) / denom).astype(np.float32)
 
 
-def _prepare_overlay_mask(proj_map: torch.Tensor) -> np.ndarray:
+def _prepare_overlay_mask(
+    proj_map: torch.Tensor,
+    global_lo: Optional[float] = None,
+    global_hi: Optional[float] = None,
+) -> np.ndarray:
     arr = proj_map.float().numpy()
     clipped = arr.copy()
-    hi = float(np.percentile(clipped, 99)) if clipped.size > 0 else 0.0
-    lo = float(np.percentile(clipped, 90)) if clipped.size > 0 else 0.0
+    if global_lo is not None and global_hi is not None:
+        lo, hi = global_lo, global_hi
+    else:
+        hi = float(np.percentile(clipped, 99)) if clipped.size > 0 else 0.0
+        lo = float(np.percentile(clipped, 90)) if clipped.size > 0 else 0.0
     if hi > lo:
-        clipped[clipped > hi] = hi
-        clipped[clipped < lo] = lo
+        clipped = np.clip(clipped, lo, hi)
     return _normalize_01(clipped)
 
 
@@ -285,6 +291,8 @@ def _save_heatmap_png(
     data: dict,
     preprocess_cfg: dict,
     class_names: dict,
+    global_lo: Optional[float] = None,
+    global_hi: Optional[float] = None,
 ):
     try:
         import matplotlib
@@ -294,7 +302,7 @@ def _save_heatmap_png(
         orig_h, orig_w = raw_img_bgr.shape[:2]
         model_input_hw = tuple(data.get('model_input_hw') or proj_map.shape)
         proj_orig = _project_map_to_original(proj_map, (orig_h, orig_w), model_input_hw, preprocess_cfg)
-        heatmap_mask = _prepare_overlay_mask(torch.from_numpy(proj_orig))
+        heatmap_mask = _prepare_overlay_mask(torch.from_numpy(proj_orig), global_lo, global_hi)
 
         image_rgb = cv2.cvtColor(raw_img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         heatmap_superimposed = show_heatmap_on_image(image_rgb, heatmap_mask)
@@ -401,15 +409,6 @@ def _run_phase_2b_image(stage1_path, tp_stats, args, net, adapter, provider, pre
                     graph_sals[i], mu_tp, sigma_tp, input_tensor,
                     args.stage2_top_f, args.stage2_boost_k, eps,
                 )
-                if proj_map is not None:
-                    _save_heatmap_png(
-                        proj_map,
-                        os.path.join(img_dir, f'proj_{type_name}_{i:03d}.png'),
-                        raw_img,
-                        data,
-                        preprocess_cfg,
-                        class_names,
-                    )
             out_rec['input_projection'] = proj_map
             out_records.append(out_rec)
         return out_records
@@ -432,6 +431,54 @@ def _run_phase_2b_image(stage1_path, tp_stats, args, net, adapter, provider, pre
     )
 
 
+def _collect_global_proj_range(run_dir: str):
+    """Scan all stage2_normalized_saliency.pth and return (global_lo, global_hi) across all projection maps."""
+    stage2_paths = sorted(glob.glob(os.path.join(run_dir, '*', 'stage2_normalized_saliency.pth')))
+    global_min = float('inf')
+    global_max = float('-inf')
+    n_maps = 0
+    for path in stage2_paths:
+        data = torch.load(path, map_location='cpu', weights_only=False)
+        for key in ('tp', 'fn', 'fp_a', 'fp_b'):
+            for rec in data.get(key, []):
+                pm = rec.get('input_projection')
+                if pm is not None:
+                    arr = pm.float().numpy()
+                    global_min = min(global_min, float(arr.min()))
+                    global_max = max(global_max, float(arr.max()))
+                    n_maps += 1
+    if n_maps == 0:
+        return None, None
+    print(f'[Phase 2b] Global projection range: lo={global_min:.6f}, hi={global_max:.6f} (n_maps={n_maps})')
+    return global_min, global_max
+
+
+def _render_heatmaps_for_image(
+    stage2_path: str,
+    pipeline_image_dir: str,
+    preprocess_cfg: dict,
+    class_names: dict,
+    global_lo: float,
+    global_hi: float,
+):
+    """Render proj_*.png heatmaps for one image using global projection range."""
+    data = torch.load(stage2_path, map_location='cpu', weights_only=False)
+    img_dir = os.path.dirname(stage2_path)
+    stem = os.path.basename(img_dir)
+    img_path = _find_image(pipeline_image_dir, stem)
+    if img_path is None:
+        print(f'  [WARN] image not found for {stem}; skipping heatmap rendering')
+        return
+    raw_img_bgr = cv2.imread(img_path)
+    for key in ('tp', 'fn', 'fp_a', 'fp_b'):
+        for i, rec in enumerate(data.get(key, [])):
+            pm = rec.get('input_projection')
+            if pm is None:
+                continue
+            out_path = os.path.join(img_dir, f'proj_{key}_{i:03d}.png')
+            _save_heatmap_png(pm, out_path, raw_img_bgr, data, preprocess_cfg, class_names, global_lo, global_hi)
+
+
 def run_phase_2b(run_dir: str, tp_stats: dict, args):
     stage1_paths = sorted(glob.glob(os.path.join(run_dir, '*', 'stage1_filter_saliency.pth')))
     if not stage1_paths:
@@ -439,6 +486,7 @@ def run_phase_2b(run_dir: str, tp_stats: dict, args):
 
     do_viz = bool(args.pipeline_image_dir)
     do_projection = do_viz and (not args.stage2_no_projection)
+    class_names = _load_class_names(args.det_annotations_json) if args.det_annotations_json else {}
     if do_projection:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         preprocess_cfg = json.loads(args.preprocess_cfg_json) if args.preprocess_cfg_json else {}
@@ -450,8 +498,20 @@ def run_phase_2b(run_dir: str, tp_stats: dict, args):
         device, preprocess_cfg, adapter, net, provider = 'cpu', {}, None, None, None
 
     print(f'[Phase 2b] Processing {len(stage1_paths)} images (projection={do_projection}, viz={do_viz})')
+    # Pass 1: compute projections and save stage2_normalized_saliency.pth + detection_boxes.png
     for path in stage1_paths:
         _run_phase_2b_image(path, tp_stats, args, net, adapter, provider, preprocess_cfg, device, do_projection, do_viz)
+
+    # Pass 2: collect global projection range, then render heatmaps with consistent scale
+    if do_projection and do_viz:
+        global_lo, global_hi = _collect_global_proj_range(run_dir)
+        if global_lo is None:
+            print('[Phase 2b] No projection maps found; skipping heatmap rendering')
+            return
+        stage2_paths = sorted(glob.glob(os.path.join(run_dir, '*', 'stage2_normalized_saliency.pth')))
+        print(f'[Phase 2b] Rendering heatmaps for {len(stage2_paths)} images with global range')
+        for path in stage2_paths:
+            _render_heatmaps_for_image(path, args.pipeline_image_dir, preprocess_cfg, class_names, global_lo, global_hi)
 
 
 def run_stage2_normalize_project(args):
